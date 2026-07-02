@@ -90,7 +90,7 @@
         ],
         "L_wrist_target": [
             "left_wrist",
-            25,
+            15,
             0,
             [
                 0.0,
@@ -138,7 +138,7 @@
         ],
         "R_wrist_target": [
             "right_wrist",
-            25,
+            15,
             0,
             [
                 0.0,
@@ -300,7 +300,7 @@
         ],
         "L_elbow_Link": [
             "left_elbow",
-            10,
+            15,
             0,
             [
                 0.0,
@@ -316,7 +316,7 @@
         ],
         "L_wrist_target": [
             "left_wrist",
-            20,
+            8,
             0,
             [
                 0.0,
@@ -348,7 +348,7 @@
         ],
         "R_elbow_Link": [
             "right_elbow",
-            10,
+            15,
             0,
             [
                 0.0,
@@ -364,7 +364,7 @@
         ],
         "R_wrist_target": [
             "right_wrist",
-            20,
+            8,
             0,
             [
                 0.0,

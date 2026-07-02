@@ -75,6 +75,9 @@ def _extract_qpos(retarget_result):
 
 
 class OnlineQposPostprocessor:
+    X02LITE_R_ELBOW_QPOS_INDEX = 7 + 7
+    X02LITE_R_ELBOW_SOFT_MAX_RAD = 1.35
+
     def __init__(
         self,
         xml_file,
@@ -91,6 +94,7 @@ class OnlineQposPostprocessor:
         self.xy_origin = None
         self.xml_file = xml_file
         self.root_body_name = root_body_name
+        self.is_x02lite = "x02lite" in str(xml_file).replace("\\", "/").lower()
 
         device = _resolve_torch_device(torch_device)
         self._set_kinematics_device(device)
@@ -143,6 +147,12 @@ class OnlineQposPostprocessor:
             if self.xy_origin is None:
                 self.xy_origin = q[:2].copy()
             q[:2] -= self.xy_origin
+
+        if self.is_x02lite and q.shape[0] > self.X02LITE_R_ELBOW_QPOS_INDEX:
+            q[self.X02LITE_R_ELBOW_QPOS_INDEX] = min(
+                q[self.X02LITE_R_ELBOW_QPOS_INDEX],
+                self.X02LITE_R_ELBOW_SOFT_MAX_RAD,
+            )
 
         self.prev_qpos = q.copy()
         return q

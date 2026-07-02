@@ -230,96 +230,6 @@ def _log_x02lite_qpos_health(qpos, postprocessor, frame_id, state):
     logger.info(f"[X02Lite/Health] frame={frame_id} " + " ".join(health_parts))
 
 
-def _model_limited_qpos_entries(state):
-    cached = state.get("_limited_qpos_entries")
-    if cached is not None:
-        return cached
-
-    retarget = state.get("retarget") if state else None
-    model = getattr(retarget, "model", None)
-    if model is None:
-        state["_limited_qpos_entries"] = []
-        return []
-
-    entries = []
-    for joint_id in range(int(model.njnt)):
-        qpos_adr = int(model.jnt_qposadr[joint_id])
-        if qpos_adr < 7:
-            continue
-        if hasattr(model, "jnt_limited") and not bool(model.jnt_limited[joint_id]):
-            continue
-
-        joint_name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, joint_id) or f"qpos_{qpos_adr}"
-        low = float(model.jnt_range[joint_id][0])
-        high = float(model.jnt_range[joint_id][1])
-        if not np.isfinite(low) or not np.isfinite(high) or low >= high:
-            continue
-        entries.append((qpos_adr, joint_name, low, high))
-
-    state["_limited_qpos_entries"] = entries
-    return entries
-
-
-def _apply_lite_11_qpos_safety(qpos, state):
-    q = np.asarray(qpos, dtype=np.float32).copy()
-    if _normalize_robot_key(state.get("robot")) != "lite_11_v1":
-        return q
-
-    margin = max(0.0, float(os.environ.get("LITE_11_LIMIT_MARGIN_RAD", "0.03")))
-    max_delta = max(0.0, float(os.environ.get("LITE_11_MAX_DELTA_RAD", "0.45")))
-
-    for qpos_adr, _name, low, high in _model_limited_qpos_entries(state):
-        lo = low + margin
-        hi = high - margin
-        if lo < hi and qpos_adr < q.shape[0]:
-            q[qpos_adr] = np.clip(q[qpos_adr], lo, hi)
-
-    prev = state.get("prev_safety_qpos")
-    if prev is not None and max_delta > 0.0 and len(prev) == len(q):
-        prev = np.asarray(prev, dtype=np.float32)
-        delta = np.clip(q[7:] - prev[7:], -max_delta, max_delta)
-        q[7:] = prev[7:] + delta
-
-    state["prev_safety_qpos"] = q.copy()
-    return q
-
-
-def _log_generic_qpos_health(qpos, frame_id, state, ik_residuals=None):
-    q = np.asarray(qpos, dtype=np.float64)
-    robot = _normalize_robot_key(state.get("robot"))
-    parts = [f"root_z={float(q[2]):.3f}"]
-
-    prev = state.get("prev_health_qpos")
-    if prev is not None and len(prev) == len(q) and len(q) > 7:
-        max_delta = float(np.max(np.abs(q[7:] - np.asarray(prev, dtype=np.float64)[7:])))
-        parts.append(f"max_dof_delta={max_delta:.3f}")
-        if max_delta > 0.45:
-            parts.append("large_dof_step")
-    state["prev_health_qpos"] = q.copy()
-
-    near_limit = []
-    margin = np.deg2rad(5.0)
-    for qpos_adr, joint_name, low, high in _model_limited_qpos_entries(state):
-        if qpos_adr >= q.shape[0]:
-            continue
-        value = float(q[qpos_adr])
-        if value <= low + margin or value >= high - margin:
-            near_limit.append(f"{joint_name}={value:.3f}")
-
-    if near_limit:
-        parts.append("near_limits=" + ";".join(near_limit[:8]))
-
-    if ik_residuals is not None:
-        try:
-            if isinstance(ik_residuals, (tuple, list)) and len(ik_residuals) > 0:
-                residual_text = ",".join(f"{float(v):.4f}" for v in ik_residuals[:2])
-                parts.append(f"ik_res={residual_text}")
-        except Exception:
-            pass
-
-    logger.info(f"[GMR/Health] robot={robot} frame={frame_id} " + " ".join(parts))
-
-
 def _align_tail_betas(raw_betas, body_model):
     betas = np.asarray(raw_betas, dtype=np.float32).reshape(-1)
     target_dim = int(getattr(body_model, "num_betas", betas.shape[0]))
@@ -1443,8 +1353,6 @@ def run_stream_mt(
             "csv_row_count": 0,
             "qpos_history": [],
             "prev_qpos_quat": None,
-            "prev_safety_qpos": None,
-            "prev_health_qpos": None,
             "ik_residuals_acc": [],
             "ik_pos_error_acc": [],
         }
@@ -1822,7 +1730,6 @@ def run_stream_mt(
 
         _t0_post = time.perf_counter()
         qp = state["postprocessor"].process(qp)
-        qp = _apply_lite_11_qpos_safety(qp, state)
         post_ms = (time.perf_counter() - _t0_post) * 1000
 
         if not os.environ.get("BENCH_DISABLE_QUAT_CLAMP", "0") == "1" and state.get("prev_qpos_quat") is not None:
@@ -1853,8 +1760,6 @@ def run_stream_mt(
 
         if str(robot_key).strip().lower() == "x02lite" and (state["csv_row_count"] == 0 or frame_id % heartbeat_frames == 0):
             _log_x02lite_qpos_health(qp, state.get("postprocessor"), frame_id, state)
-        if state["csv_row_count"] == 0 or frame_id % heartbeat_frames == 0:
-            _log_generic_qpos_health(qp, frame_id, state, ik_residuals)
 
         _t0_csv = time.perf_counter()
         row = _build_unity_csv_row(qp, robot_key, state["csv_path"], frame_id)

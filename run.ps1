@@ -73,6 +73,9 @@ function Get-CondaEnvPythonCandidates {
 
     Add-UniqueString $roots "D:\anaconda3"
     Add-UniqueString $roots "D:\miniconda3"
+    Add-UniqueString $roots "D:\Anaconda"
+    Add-UniqueString $roots "C:\Anaconda3"
+    Add-UniqueString $roots "C:\Anaconda"
 
     $candidates = New-Object 'System.Collections.Generic.List[string]'
     if ($env:CONDA_PREFIX) {

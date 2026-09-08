@@ -26,6 +26,7 @@ ROBOT_XML_DICT = {
     "x02lite": ASSET_ROOT / "x02lite" / "scene.xml",
     "openloong": ASSET_ROOT / "openloong" / "scene_white.xml",
     "lite_11_v1": ASSET_ROOT / "Lite_11_v1" / "xml" / "scene_plane.xml",
+     "linglong2": ASSET_ROOT / "linglong2" / "linglong2.xml",
 }
 
 IK_CONFIG_DICT = {
@@ -51,6 +52,7 @@ IK_CONFIG_DICT = {
         "x02lite": IK_CONFIG_ROOT / "smplx_to_x02lite.json",
         "openloong": IK_CONFIG_ROOT / "smplx_to_openloong.json",
         "lite_11_v1": IK_CONFIG_ROOT / "smplx_to_lite_11_v1.json",
+        "linglong2": IK_CONFIG_ROOT / "smplx_to_linglong2.json",
     },
     "bvh_lafan1":{
         "unitree_g1": IK_CONFIG_ROOT / "bvh_lafan1_to_g1.json",
@@ -107,6 +109,7 @@ ROBOT_BASE_DICT = {
     "x02lite": "pelvis",
     "openloong": "base_link",
     "lite_11_v1": "base_link",
+     "linglong2": "base_link",
 }
 
 VIEWER_CAM_DISTANCE_DICT = {
@@ -131,4 +134,5 @@ VIEWER_CAM_DISTANCE_DICT = {
     "x02lite": 3.0,
     "openloong": 3.5,
     "lite_11_v1": 2.6,
+    "linglong2": 2.5,
 }

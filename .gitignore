@@ -135,3 +135,12 @@ wham-gmr_local.tar.gz
 LaTeX2e*
 
 results
+
+# Secrets
+SecretKey.csv
+*.key
+*.pem
+
+# Backups
+*.bak
+*.bak_*

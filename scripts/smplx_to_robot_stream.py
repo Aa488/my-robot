@@ -99,6 +99,40 @@ class OnlineQposPostprocessor:
         device = _resolve_torch_device(torch_device)
         self._set_kinematics_device(device)
 
+        # Distance from the lowest body frame (e.g. the ankle) down to the actual
+        # sole of the foot mesh.  height_adjust aligns the lowest *frame* to the
+        # ground, which leaves the sole buried underground, so we add this back.
+        self.sole_offset = self._compute_sole_offset()
+
+    def _compute_sole_offset(self, clearance=0.005):
+        try:
+            import mujoco as mj
+            m = mj.MjModel.from_xml_path(self.xml_file)
+            d = mj.MjData(m)
+            d.qpos[:] = 0.0
+            if m.nq >= 7:
+                d.qpos[3] = 1.0  # identity quaternion (w=1)
+            mj.mj_forward(m, d)
+            lowest_frame = float(np.min(d.xpos[1:, 2]))  # exclude world body
+            lowest_vert = float("inf")
+            for g in range(m.ngeom):
+                if m.geom_type[g] != mj.mjtGeom.mjGEOM_MESH:
+                    continue
+                if m.geom_group[g] != 0:
+                    continue
+                mid = m.geom_dataid[g]
+                start = m.mesh_vertadr[mid]
+                count = m.mesh_vertnum[mid]
+                verts = m.mesh_vert[start:start + count]
+                w = verts @ d.geom_xmat[g].reshape(3, 3).T + d.geom_xpos[g]
+                lowest_vert = min(lowest_vert, float(np.min(w[:, 2])))
+            if lowest_vert == float("inf"):
+                return 0.0
+            return max(0.0, float(lowest_frame - lowest_vert) + float(clearance))
+        except Exception as e:
+            print(f"[Stream] Warning: could not compute foot sole offset ({e}); using 0.")
+            return 0.0
+
     def _set_kinematics_device(self, device):
         self.device = device
         self.kinematics_model = KinematicsModel(
@@ -141,7 +175,7 @@ class OnlineQposPostprocessor:
                     lowest_height = self._forward_kinematics_for_height(q)
                 else:
                     raise
-            q[2] -= lowest_height
+            q[2] -= (lowest_height - self.sole_offset)
 
         if self.root_origin_offset:
             if self.xy_origin is None:

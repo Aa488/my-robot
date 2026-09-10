@@ -74,6 +74,63 @@ def _extract_qpos(retarget_result):
     return retarget_result
 
 
+def _segment_segment_distance(p1, p2, p3, p4):
+    """Minimum distance between line segments p1-p2 and p3-p4 (Ericson 2005)."""
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    p3 = np.asarray(p3, dtype=np.float64)
+    p4 = np.asarray(p4, dtype=np.float64)
+    u = p2 - p1
+    v = p4 - p3
+    w = p1 - p3
+    a = float(np.dot(u, u))
+    b = float(np.dot(u, v))
+    c = float(np.dot(v, v))
+    d = float(np.dot(u, w))
+    e = float(np.dot(v, w))
+    D = a * c - b * b
+    sN = tN = D
+    sD = tD = D
+    if D < 1e-8:
+        sN = 0.0
+        sD = 1.0
+        tN = e
+        tD = c
+    else:
+        sN = b * e - c * d
+        tN = a * e - b * d
+        if sN < 0.0:
+            sN = 0.0
+            tN = e
+            tD = c
+        elif sN > sD:
+            sN = sD
+            tN = e + b
+            tD = c
+    if tN < 0.0:
+        tN = 0.0
+        if -d < 0.0:
+            sN = 0.0
+        elif -d > a:
+            sN = sD
+        else:
+            sN = -d
+            sD = a
+    elif tN > tD:
+        tN = tD
+        if (-d + b) < 0.0:
+            sN = 0.0
+        elif (-d + b) > a:
+            sN = sD
+        else:
+            sN = -d + b
+            sD = a
+    sc = 0.0 if abs(sN) < 1e-8 else sN / sD
+    tc = 0.0 if abs(tN) < 1e-8 else tN / tD
+    dp = w + sc * u - tc * v
+    return float(np.linalg.norm(dp))
+
+
 class OnlineQposPostprocessor:
     X02LITE_R_ELBOW_QPOS_INDEX = 7 + 7
     X02LITE_R_ELBOW_SOFT_MAX_RAD = 1.35
@@ -83,11 +140,13 @@ class OnlineQposPostprocessor:
         xml_file,
         root_body_name=None,
         smooth_alpha=0.25,
+        arm_smooth_alpha=0.3,
         height_adjust=True,
         root_origin_offset=True,
         torch_device="auto",
     ):
         self.smooth_alpha = float(smooth_alpha)
+        self.arm_smooth_alpha = float(arm_smooth_alpha)
         self.height_adjust = bool(height_adjust)
         self.root_origin_offset = bool(root_origin_offset)
         self.prev_qpos = None
@@ -95,6 +154,7 @@ class OnlineQposPostprocessor:
         self.xml_file = xml_file
         self.root_body_name = root_body_name
         self.is_x02lite = "x02lite" in str(xml_file).replace("\\", "/").lower()
+        self._arm_nudge_smoothed = {}
 
         device = _resolve_torch_device(torch_device)
         self._set_kinematics_device(device)
@@ -103,6 +163,298 @@ class OnlineQposPostprocessor:
         # sole of the foot mesh.  height_adjust aligns the lowest *frame* to the
         # ground, which leaves the sole buried underground, so we add this back.
         self.sole_offset = self._compute_sole_offset()
+
+        # Detect foot bodies and their ankle-pitch/knee/hip-pitch joint indices so
+        # we can flatten the foot onto the ground during stance (fixes the
+        # "hovering" look when WHAM reports the foot toe-down).  Empty -> disabled.
+        self._foot_pitch_chain = self._detect_foot_pitch_chain()
+
+        # Detect arms and their shoulder-roll (abduction) dof plus the thigh they
+        # can clip, so we can push the forearm clear of the hip during sit->stand.
+        self._arm_thigh_chain = self._detect_arm_thigh_chain()
+
+    def _detect_foot_pitch_chain(self):
+        """Map foot body name -> ankle-pitch dof index for flat-foot grounding.
+
+        A foot is the last link of a leg (``<prefix>_ankle_roll_link`` here), and
+        its ankle-pitch joint is the hinge on the parent
+        ``<prefix>_ankle_pitch_link`` body.  Returns [] when the naming convention
+        is not recognized (feature silently disabled)."""
+        names = self.kinematics_model.body_names
+        dof_indices = self.kinematics_model.joint_dof_idx
+        dof_of = {
+            name: dof_indices[i]
+            for i, name in enumerate(names)
+            if dof_indices[i] >= 0
+        }
+        chain = []
+        for name in names:
+            if not name.endswith("_ankle_roll_link"):
+                continue
+            prefix = name[: -len("_ankle_roll_link")]
+            ankle_pitch = dof_of.get(prefix + "_ankle_pitch_link")
+            if ankle_pitch is None:
+                continue
+            chain.append({"foot_body": name, "ankle_pitch": ankle_pitch})
+        if chain:
+            print(f"[Stream] Flat-foot grounding enabled for: "
+                  f"{', '.join(c['foot_body'] for c in chain)}")
+        return chain
+
+    def _detect_arm_thigh_chain(self):
+        """Map each arm to its shoulder-roll (abduction) dof and the segments it
+        clips.
+
+        An arm is recognised by its ``<prefix>_elbow_link``; the forearm runs from
+        there to ``<prefix>_wrist_yaw_link``.  Its obstacles are the thigh
+        (``<prefix>_hip_yaw_link`` -> ``<prefix>_knee_link``) and, for the left arm
+        only, the hip/pelvis (``base_link`` -> ``<prefix>_hip_pitch_link``).
+        Returns [] when the naming convention is not recognised (feature silently
+        disabled)."""
+        names = self.kinematics_model.body_names
+        dof_indices = self.kinematics_model.joint_dof_idx
+        dof_of = {
+            name: dof_indices[i]
+            for i, name in enumerate(names)
+            if dof_indices[i] >= 0
+        }
+        lo, hi = self._dof_limits()
+        chain = []
+        for name in names:
+            if not name.endswith("_elbow_link"):
+                continue
+            prefix = name[: -len("_elbow_link")]
+            shoulder_roll = dof_of.get(prefix + "_shoulder_roll_link")
+            wrist = prefix + "_wrist_yaw_link"
+            thigh = prefix + "_hip_yaw_link"
+            knee = prefix + "_knee_link"
+            hip = prefix + "_hip_pitch_link"
+            if shoulder_roll is None:
+                continue
+            if wrist not in names or thigh not in names or knee not in names:
+                continue
+            # Every shoulder/elbow dof we may rotate to clear the thigh.
+            arm_dofs = [
+                dof_of[prefix + "_" + seg + "_link"]
+                for seg in ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow")
+                if prefix + "_" + seg + "_link" in dof_of
+            ]
+            # Abduction is the side of the shoulder-roll joint with the wider
+            # travel (for a symmetric humanoid the sign flips between arms).
+            abduct_sign = 1.0 if hi[shoulder_roll] >= -lo[shoulder_roll] else -1.0
+            # The forearm can also clip through the hip/pelvis, not just the
+            # thigh.  The hip segment runs from the pelvis (root body) down to the
+            # hip-pitch joint; the left arm (the side seen clipping) avoids it too.
+            hip_a = hip_b = None
+            if "left" in prefix and hip in names:
+                hip_a = self.kinematics_model.body_names[0]  # pelvis / root body
+                hip_b = hip
+            chain.append({
+                "shoulder_roll": shoulder_roll,
+                "abduct_sign": abduct_sign,
+                "arm_dofs": arm_dofs,
+                "elbow_body": name,
+                "wrist_body": wrist,
+                "thigh_body": thigh,
+                "knee_body": knee,
+                "hip_a_body": hip_a,
+                "hip_b_body": hip_b,
+            })
+        if chain:
+            print(f"[Stream] Arm-thigh collision avoidance enabled for: "
+                  f"{', '.join(c['elbow_body'] for c in chain)}")
+        return chain
+
+    def _get_mj_model(self):
+        if getattr(self, "_mj", None) is None:
+            import mujoco as mj
+            self._mj = mj
+            self._mj_model = mj.MjModel.from_xml_path(self.xml_file)
+            self._mj_data = mj.MjData(self._mj_model)
+            self._mj_body_id_cache = {}
+        return self._mj_model, self._mj_data
+
+    def _mj_body_id(self, name):
+        self._get_mj_model()
+        if name not in self._mj_body_id_cache:
+            self._mj_body_id_cache[name] = self._mj.mj_name2id(
+                self._mj_model, self._mj.mjtObj.mjOBJ_BODY, name
+            )
+        return self._mj_body_id_cache[name]
+
+    def _sole_lowest_z(self, m, d, body_name):
+        """Lowest world z of a body's visual (group 0) mesh vertices."""
+        bid = self._mj_body_id(body_name)
+        zmin = float("inf")
+        for g in range(m.ngeom):
+            if m.geom_bodyid[g] != bid:
+                continue
+            if m.geom_type[g] != self._mj.mjtGeom.mjGEOM_MESH:
+                continue
+            if m.geom_group[g] != 0:
+                continue
+            mid = m.geom_dataid[g]
+            start = m.mesh_vertadr[mid]
+            count = m.mesh_vertnum[mid]
+            verts = m.mesh_vert[start:start + count]
+            w = verts @ d.geom_xmat[g].reshape(3, 3).T + d.geom_xpos[g]
+            zmin = min(zmin, float(np.min(w[:, 2])))
+        return zmin
+
+    def _dof_limits(self):
+        if getattr(self, "_dof_lo", None) is None:
+            lo, hi = self.kinematics_model.get_dof_limits()
+            self._dof_lo = lo.detach().cpu().numpy().astype(np.float64)
+            self._dof_hi = hi.detach().cpu().numpy().astype(np.float64)
+        return self._dof_lo, self._dof_hi
+
+    def _flatten_stance_feet(self, q, stance_clearance=0.03, blend=0.6, max_step=0.3):
+        """Rotate each planted foot's ankle-pitch so its sole sits flat on the ground.
+
+        WHAM (especially from a top-down drone view) estimates the foot with a
+        toe-down tilt during stance, which reads as the heel hovering and the toe
+        digging in.  For a planted foot we rotate the ankle-pitch joint by the
+        amount that brings the foot's world forward axis back to horizontal, using
+        a numerical Jacobian of that axis w.r.t. the ankle-pitch dof (so the
+        joint's axis/rotation sign conventions are handled automatically).
+        Swing feet (sole clearly above the ground) are left untouched."""
+        if not self._foot_pitch_chain or self.sole_offset <= 0:
+            return q
+        m, d = self._get_mj_model()
+        d.qpos[:] = q
+        self._mj.mj_forward(m, d)
+        lower, upper = self._dof_limits()
+        for c in self._foot_pitch_chain:
+            # Planted when the lowest point of the sole mesh is near the ground.
+            if self._sole_lowest_z(m, d, c["foot_body"]) > stance_clearance:
+                continue
+            bid = self._mj_body_id(c["foot_body"])
+            dof = c["ankle_pitch"]
+            fwd = d.xmat[bid].reshape(3, 3)[:, 0]  # world forward (local +x)
+            fz = float(fwd[2])
+            if abs(fz) < 1e-4:
+                continue
+            # Numerical Jacobian: d(fwd_z) / d(ankle_pitch).
+            q_test = q.copy()
+            q_test[7 + dof] += 0.02
+            d.qpos[:] = q_test
+            self._mj.mj_forward(m, d)
+            fz_p = float(d.xmat[bid].reshape(3, 3)[:, 0][2])
+            gain = (fz_p - fz) / 0.02
+            if abs(gain) < 1e-4:
+                continue
+            dtheta = float(np.clip(-fz / gain, -max_step, max_step))
+            new = float(np.clip(float(q[7 + dof]) + dtheta * blend, lower[dof], upper[dof]))
+            q[7 + dof] = new
+            # Re-forward so the next foot sees the updated pose.
+            d.qpos[:] = q
+            self._mj.mj_forward(m, d)
+        return q
+
+    def _arm_obstacles(self, c):
+        """Segments the forearm must stay clear of: the thigh, and (for the left
+        arm) the hip/pelvis as well."""
+        segs = [(c["thigh_body"], c["knee_body"])]
+        if c.get("hip_a_body") is not None:
+            segs.append((c["hip_a_body"], c["hip_b_body"]))
+        return segs
+
+    def _arm_clearance(self, d, c):
+        """Nearest (dist, a_body, b_body) of the forearm's obstacles to its
+        centerline."""
+        a = d.xpos[self._mj_body_id(c["elbow_body"])]
+        b = d.xpos[self._mj_body_id(c["wrist_body"])]
+        best = None
+        for pa, pb in self._arm_obstacles(c):
+            dist = _segment_segment_distance(
+                a, b, d.xpos[self._mj_body_id(pa)], d.xpos[self._mj_body_id(pb)]
+            )
+            if best is None or dist < best[0]:
+                best = (dist, pa, pb)
+        return best
+
+    def _arm_gain(self, m, d, c, qw, dof, sign, obs, dist, step=0.05):
+        """Forward-difference of the forearm->obstacle distance w.r.t. ``dof`` in
+        direction ``sign`` (or -inf if the move leaves the joint range)."""
+        lower, upper = self._dof_limits()
+        new_val = float(qw[7 + dof]) + step * sign
+        if new_val < lower[dof] or new_val > upper[dof]:
+            return float("-inf")
+        q_probe = qw.copy()
+        q_probe[7 + dof] = new_val
+        d.qpos[:] = q_probe
+        self._mj.mj_forward(m, d)
+        a = d.xpos[self._mj_body_id(c["elbow_body"])]
+        b = d.xpos[self._mj_body_id(c["wrist_body"])]
+        pa, pb = obs
+        d_new = _segment_segment_distance(
+            a, b, d.xpos[self._mj_body_id(pa)], d.xpos[self._mj_body_id(pb)]
+        )
+        return (d_new - dist) / step
+
+    def _avoid_arm_thigh_collision(self, q, clearance=0.13, blend=0.9, max_step=0.15, max_iters=6):
+        """Keep the forearms clear of the thighs (and, for the left arm, the hip).
+
+        When the arm hangs by the side the forearm can pass through the thigh or
+        the hip/pelvis (reading as the hand/forearm intersecting the hip/butt
+        during sit->stand).  For any arm whose forearm centerline is closer than
+        ``clearance`` to the nearest obstacle segment we rotate the arm away.
+        Normally this is shoulder-roll abduction (raising the arm out to the
+        side), but during sit->stand the hand naturally presses onto the front of
+        the thigh, where abduction would push the forearm straight through it; in
+        that case we search the whole shoulder+elbow chain for whichever joint
+        clears it best.  The correction (offset from the raw pose) is
+        exponentially smoothed per joint across frames so the arm eases out and
+        back instead of snapping."""
+        if not self._arm_thigh_chain:
+            return q
+        m, d = self._get_mj_model()
+        lower, upper = self._dof_limits()
+        for c in self._arm_thigh_chain:
+            # Solve for the collision-free pose on a working copy of the pose.
+            qw = q.copy()
+            d.qpos[:] = qw
+            self._mj.mj_forward(m, d)
+            for _ in range(max_iters):
+                dist, pa, pb = self._arm_clearance(d, c)
+                if dist >= clearance:
+                    break
+                deficit = clearance - dist
+                obs = (pa, pb)
+                # Primary: abduction.  This keeps the ordinary by-the-side
+                # correction unchanged.
+                gain_abd = self._arm_gain(m, d, c, qw, c["shoulder_roll"], c["abduct_sign"], obs, dist)
+                best = (gain_abd, c["shoulder_roll"], c["abduct_sign"]) if gain_abd > 1e-4 else None
+                if best is None:
+                    # Fallback: abduction would push the forearm further into the
+                    # thigh/hip (e.g. hands pressing down on the thighs).  Pick
+                    # whichever shoulder/elbow dof clears it best.
+                    for dof in c["arm_dofs"]:
+                        for sign in (+1.0, -1.0):
+                            gain = self._arm_gain(m, d, c, qw, dof, sign, obs, dist)
+                            if gain > 1e-4 and (best is None or gain > best[0]):
+                                best = (gain, dof, sign)
+                if best is None:
+                    break
+                gain, dof, sign = best
+                dtheta = float(np.clip(deficit / gain, 0.0, max_step))
+                new = float(np.clip(float(qw[7 + dof]) + sign * dtheta * blend, lower[dof], upper[dof]))
+                if abs(new - qw[7 + dof]) < 1e-5:
+                    break
+                qw[7 + dof] = new
+                d.qpos[:] = qw
+                self._mj.mj_forward(m, d)
+            # Smooth the correction (offset from the raw pose) per joint so the
+            # arm eases out/back gradually and switching joints stays smooth.
+            for dof in c["arm_dofs"]:
+                nudge = float(qw[7 + dof] - q[7 + dof])
+                prev = self._arm_nudge_smoothed.get(dof, 0.0)
+                smoothed = self.arm_smooth_alpha * nudge + (1.0 - self.arm_smooth_alpha) * prev
+                self._arm_nudge_smoothed[dof] = smoothed
+                q[7 + dof] = float(q[7 + dof]) + smoothed
+        d.qpos[:] = q
+        self._mj.mj_forward(m, d)
+        return q
 
     def _compute_sole_offset(self, clearance=0.005):
         try:
@@ -176,6 +528,14 @@ class OnlineQposPostprocessor:
                 else:
                     raise
             q[2] -= (lowest_height - self.sole_offset)
+
+            # After grounding, flatten each planted foot so its sole is parallel to
+            # the ground (fixes heel-hover / toe-dig from a toe-down WHAM estimate).
+            self._flatten_stance_feet(q)
+
+            # Keep the forearms clear of the thighs (fixes hand/forearm clipping the
+            # hip during sit->stand when the arms hang by the side).
+            self._avoid_arm_thigh_collision(q)
 
         if self.root_origin_offset:
             if self.xy_origin is None:

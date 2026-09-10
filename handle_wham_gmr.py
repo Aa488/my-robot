@@ -1348,6 +1348,9 @@ def run_stream_mt(
             "csv_file": None,
             "csv_writer": None,
             "csv_path": None,
+            "source_feet_path": None,
+            "source_feet_file": None,
+            "source_feet_writer": None,
             "metadata_path": None,
             "metadata_written": False,
             "csv_row_count": 0,
@@ -1395,6 +1398,24 @@ def run_stream_mt(
             state["csv_writer"] = csv.writer(state["csv_file"])
             state["last_csv_flush_time"] = time.time()
             logger.info(f"[GMR] CSV output opened: robot={robot_key} path={csv_path}")
+
+            # Sidecar: dump WHAM source foot/ankle world positions per frame,
+            # aligned with live_motion.csv row order by frame_id.  Lets us
+            # compare source foot height vs robot foot height for debugging
+            # (e.g. distinguishing genuine steps from WHAM foot-float bias).
+            source_feet_path = os.path.join(csv_dir, "source_feet.csv")
+            state["source_feet_path"] = source_feet_path
+            state["source_feet_file"] = open(source_feet_path, "w", newline="")
+            state["source_feet_writer"] = csv.writer(state["source_feet_file"])
+            state["source_feet_writer"].writerow([
+                "frame_id",
+                "left_foot_x", "left_foot_y", "left_foot_z",
+                "right_foot_x", "right_foot_y", "right_foot_z",
+                "left_ankle_x", "left_ankle_y", "left_ankle_z",
+                "right_ankle_x", "right_ankle_y", "right_ankle_z",
+            ])
+            state["source_feet_file"].flush()
+            logger.info(f"[GMR] source-feet dump opened: robot={robot_key} path={source_feet_path}")
         
     def tail_params_to_smplx_frame(params):
         _dev = torch.device(gmr_args.torch_device) if gmr_args and gmr_args.torch_device != "cpu" else torch.device("cpu")
@@ -1720,9 +1741,56 @@ def run_stream_mt(
             with state["lock"]:
                 state["worker_dropped"] += 1
 
+    def _flatten_source_feet(state, sf):
+        """Re-derive each foot's ball height from its own (reliable) ankle.
+
+        WHAM estimates the swing foot dorsiflexed (toes up) and the stance foot
+        plantarflexed (toes down), so the two feet's ball (``*_foot``) joints
+        land at spuriously different heights even when both feet are on the
+        ground.  The ankle heights are reliable, so when a foot's ankle is near
+        the running ground-ankle level we pull its ball back to the flat-foot
+        offset below its own ankle.  This removes the left/right ball asymmetry
+        that lifts the tap foot ~7cm off the ground, and is driven by each
+        foot's own ankle (so it never moves a foot that is genuinely raised).
+
+        Opt out with GMR_FLATTEN_FEET=0; tune the offset with GMR_FLAT_OFFSET.
+        """
+        if os.environ.get("GMR_FLATTEN_FEET", "1") == "0":
+            return
+        if not sf or "left_foot" not in sf or "left_ankle" not in sf:
+            return
+        flat = state.get("foot_flat_offset")
+        if flat is None:
+            flat = float(os.environ.get("GMR_FLAT_OFFSET", "-0.067"))
+            state["foot_flat_offset"] = flat
+
+        lf = sf["left_foot"][0]; rf = sf["right_foot"][0]
+        la = sf["left_ankle"][0]; ra = sf["right_ankle"][0]
+        lz = float(la[2]); rz = float(ra[2])
+
+        # Stance reference = the lower of the two ankles *this frame*.  This is
+        # drift-free (the pelvis's ~70cm vertical wander cancels out), unlike a
+        # trailing-min which lags the current ankles during drift.
+        amin = min(lz, rz)
+
+        def ramp(h):
+            # Full correction at/below 6cm above the lower ankle, fading to none
+            # at 12cm (a foot genuinely lifted well above the stance foot is left
+            # untouched; the snap fades in/out smoothly rather than popping).
+            return float(np.clip((0.12 - h) / 0.06, 0.0, 1.0))
+
+        wl = ramp(lz - amin)
+        if wl > 0.0:
+            lf[2] = (lz + flat) * wl + float(lf[2]) * (1.0 - wl)
+        wr = ramp(rz - amin)
+        if wr > 0.0:
+            rf[2] = (rz + flat) * wr + float(rf[2]) * (1.0 - wr)
+
     def _process_gmr_worker_frame(state, frame_id, sf, betas):
         robot_key = state["robot"]
         init_gmr_state(state, betas, create_viewer=False)
+
+        _flatten_source_feet(state, sf)
 
         _t0_ik = time.perf_counter()
         qp, ik_residuals = state["retarget"].retarget(sf)
@@ -1776,6 +1844,22 @@ def run_stream_mt(
                 csv_fh.flush()
                 state["last_csv_flush_time"] = now_for_flush
         csv_ms = (time.perf_counter() - _t0_csv) * 1000
+
+        # Sidecar dump: WHAM source foot/ankle world positions, aligned to this
+        # CSV row by frame_id (enables source-vs-robot foot-height comparison).
+        sfw = state.get("source_feet_writer")
+        if sfw is not None:
+            try:
+                def _foot_xyz(name):
+                    p = np.asarray(sf[name][0], dtype=np.float64)
+                    return float(p[0]), float(p[1]), float(p[2])
+                lf = _foot_xyz("left_foot"); rf = _foot_xyz("right_foot")
+                la = _foot_xyz("left_ankle"); ra = _foot_xyz("right_ankle")
+                sfw.writerow([int(frame_id), *lf, *rf, *la, *ra])
+                if state["csv_row_count"] % csv_flush_rows == 0:
+                    state["source_feet_file"].flush()
+            except Exception as e:
+                logger.warning(f"[GMR] source-feet dump failed frame={frame_id}: {e}")
 
         state["qpos_history"].append(qp.copy())
         with state["lock"]:
@@ -2191,6 +2275,13 @@ def run_stream_mt(
                 try:
                     csv_fh.flush()
                     csv_fh.close()
+                except Exception:
+                    pass
+            sff = state.get("source_feet_file")
+            if sff is not None:
+                try:
+                    sff.flush()
+                    sff.close()
                 except Exception:
                     pass
 

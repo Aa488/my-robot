@@ -142,6 +142,11 @@ class Network(nn.Module):
         # --------- Refine trajectory --------- #
         update_vel = reset_root_velocity(self.smpl, self.output, self.pred_contact, self.pred_root, self.pred_vel, thr=0.5)
         output = self.trajectory_refiner(self.old_motion_context, update_vel, output, cam_angvel, return_y_up=return_y_up)
+        # Expose the deterministic foot-contact de-biased root velocity (the
+        # reset_root_velocity output) directly, WITHOUT the TrajectoryRefiner's
+        # learned delta_vel.  The learned delta_vel over-smooths and erases
+        # genuine walking, so consumers integrate vel_root_reset instead.
+        output['vel_root_reset'] = update_vel
         # --------- #
         
         # Do rollout
@@ -197,6 +202,27 @@ class Network(nn.Module):
             output = self.refine_trajectory(output, cam_angvel, return_y_up)
         else:
             output = self.rollout(output, self.pred_root, self.pred_vel, return_y_up)
+            # Expose the deterministic foot-contact de-biased root velocity even
+            # when the learned TrajectoryRefiner is skipped (refine_traj=False,
+            # the streaming path).  This is reset_root_velocity's output WITHOUT
+            # the refiner's over-smoothing delta_vel, so it removes planted-foot
+            # slip bias while preserving genuine walking.
+            #
+            # reset_root_velocity differences foot positions over the time dim,
+            # so it needs >=2 frames.  In streaming "tail" mode the sliding
+            # window starts at f=1 (first frame), where there is nothing to
+            # de-bias yet — skip and let the consumer fall back to raw vel_root.
+            try:
+                if self.pred_vel.shape[1] >= 2:
+                    output['vel_root_reset'] = reset_root_velocity(
+                        self.smpl, self.output, self.pred_contact,
+                        self.pred_root, self.pred_vel, thr=0.5
+                    )
+            except Exception as _e:
+                # Fall back to raw vel_root downstream.
+                if not getattr(Network, '_warned_vel_root_reset', False):
+                    Network._warned_vel_root_reset = True
+                    print(f"[WHAM] vel_root_reset unavailable, falling back to raw vel_root: {_e}", flush=True)
         # --------- #
         
         return output

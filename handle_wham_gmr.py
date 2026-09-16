@@ -765,6 +765,17 @@ def run_stream_mt(
         if 'vel_root' in pred:
             vel_root = extract_latest_vec(pred['vel_root'], 'vel_root')
             result['vel_root'] = vel_root.detach().cpu().numpy()
+        # Foot-contact de-biased root velocity (reset_root_velocity output).
+        # Preferred over raw vel_root: removes planted-foot slip bias while
+        # preserving genuine walking.  Fall back to vel_root when absent or
+        # empty (reset_root_velocity needs >=2 frames, so the first frame of a
+        # streaming window has none).
+        if 'vel_root_reset' in pred:
+            _vrr = pred['vel_root_reset']
+            if _vrr is not None and getattr(_vrr, 'numel', lambda: 0)() > 0 and _vrr.ndim >= 2 and _vrr.shape[1] > 0:
+                result['vel_root_reset'] = extract_latest_vec(
+                    _vrr, 'vel_root_reset'
+                ).detach().cpu().numpy()
         if 'poses_root_world' in pred:
             result['poses_root_world_mat'] = extract_latest_root_pose(
                 pred['poses_root_world']
@@ -1741,6 +1752,92 @@ def run_stream_mt(
             with state["lock"]:
                 state["worker_dropped"] += 1
 
+    def _suppress_foot_float(state, sf, side):
+        """Suppress WHAM's mid-stride foot re-lift ("踏空") for one foot (`side`).
+
+        From a top-down drone view, WHAM sometimes estimates a foot descending
+        toward the ground and then re-lifting a few cm before it actually
+        plants, which the robot faithfully reproduces as a "down-up-down"
+        bounce (e.g. the first big stride: the left foot drops to ~1.5cm,
+        bounces to ~11cm, then plants).  The trailing foot shows the same
+        artifact at a smaller scale -- a brief ~8mm lift during its swing
+        descent.  The re-lift is a pure vertical artifact: the foot's horizontal
+        position stays put, so we latch the foot once it has clearly passed the
+        peak of its swing and then hold it at its running-minimum height until
+        it genuinely plants.  This only ever pulls that one foot DOWN; it never
+        raises it, never touches the other foot, and leaves genuine swings (foot
+        still clearly in the air) alone.
+
+        Applied to both feet.  The trigger is peak-relative (rather than a fixed
+        latch) so it catches both the big near-ground bounce and the small
+        mid-descent re-lift without crushing a shallow swing whose peak sits
+        just above the latch.
+
+        Per-frame state machine (stored on `state`, keyed by robot + side):
+          planted -> up      when the ankle rises > latch above the lower ankle
+          up      -> down    when it falls `descend` below its swing peak
+          down    -> planted when the held height drops < release (true plant)
+          down    clamps any re-lift back to its running minimum (up to max_hold frames).
+
+        Opt out with GMR_LEFT_FOOT_FLOAT=0 / GMR_RIGHT_FOOT_FLOAT=0.
+        """
+        gate = "GMR_LEFT_FOOT_FLOAT" if side == "left" else "GMR_RIGHT_FOOT_FLOAT"
+        if os.environ.get(gate, "1") == "0":
+            return
+        foot_k = side + "_foot"
+        ankle_k = side + "_ankle"
+        other_ankle_k = "right_ankle" if side == "left" else "left_ankle"
+        if not sf or foot_k not in sf or ankle_k not in sf or other_ankle_k not in sf:
+            return
+
+        latch = float(os.environ.get("GMR_FOOT_LATCH", "0.030"))          # m, enter swing
+        descend = float(os.environ.get("GMR_FOOT_DESCEND", "0.020"))       # m, confirmed descending
+        release = float(os.environ.get("GMR_FOOT_RELEASE", "0.005"))       # m, true plant
+        relift_eps = float(os.environ.get("GMR_FOOT_RELIFT_EPS", "0.003"))  # m, re-lift detection
+        max_hold = int(os.environ.get("GMR_FOOT_MAX_HOLD", "120"))         # frames
+
+        fst_key = side + "_foot_float"
+        fst = state.get(fst_key)
+        if fst is None:
+            fst = {"phase": "planted", "peak": 0.0, "hold_h": 0.0, "hold_count": 0}
+            state[fst_key] = fst
+
+        ank = sf[ankle_k][0]
+        f = sf[foot_k][0]
+        oank = sf[other_ankle_k][0]
+        z = float(ank[2]); oz = float(oank[2])
+        amin = min(z, oz)  # lower ankle = drift-free ground reference
+        h = z - amin       # this foot's ankle height above the lower ankle
+
+        phase = fst["phase"]
+        if phase == "planted":
+            if h > latch:
+                fst["phase"] = "up"
+                fst["peak"] = h
+        elif phase == "up":
+            if h > fst["peak"]:
+                fst["peak"] = h
+            elif h < fst["peak"] - descend:
+                fst["phase"] = "down"
+                fst["hold_h"] = h
+                fst["hold_count"] = 0
+        else:  # down
+            fst["hold_count"] += 1
+            if h < fst["hold_h"]:
+                fst["hold_h"] = h
+                if fst["hold_h"] < release:
+                    fst["phase"] = "planted"
+            elif h > fst["hold_h"] + relift_eps:
+                # Re-lift: pull the whole foot (ankle + ball) back down to the
+                # held height, keeping the ankle-foot geometry intact.
+                dlz = (amin + fst["hold_h"]) - z
+                ank[2] += dlz
+                f[2] += dlz
+            if fst["hold_count"] > max_hold:
+                fst["phase"] = "up"
+                fst["peak"] = h
+                fst["hold_h"] = h
+
     def _flatten_source_feet(state, sf):
         """Re-derive each foot's ball height from its own (reliable) ankle.
 
@@ -1790,6 +1887,8 @@ def run_stream_mt(
         robot_key = state["robot"]
         init_gmr_state(state, betas, create_viewer=False)
 
+        _suppress_foot_float(state, sf, "left")
+        _suppress_foot_float(state, sf, "right")
         _flatten_source_feet(state, sf)
 
         _t0_ik = time.perf_counter()
@@ -1980,7 +2079,12 @@ def run_stream_mt(
                     gmr_state["prev_raw_pelvis_pos"] = curr_raw.copy()
                     gmr_state["prev_frame_id"] = frame_id
                 elif not _bench_no_vel:
-                    vel_root = gvhmr_params.get('vel_root')
+                    # Prefer the foot-contact de-biased velocity; fall back to
+                    # raw vel_root for WHAM builds without vel_root_reset (or
+                    # when the first frame of a window has no de-biased value).
+                    vel_root = gvhmr_params.get('vel_root_reset')
+                    if vel_root is None:
+                        vel_root = gvhmr_params.get('vel_root')
                     root_mat = gvhmr_params.get('poses_root_world_mat')
 
                     if vel_root is not None and root_mat is not None:

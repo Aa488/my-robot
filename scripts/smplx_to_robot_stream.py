@@ -155,6 +155,7 @@ class OnlineQposPostprocessor:
         self.root_body_name = root_body_name
         self.is_x02lite = "x02lite" in str(xml_file).replace("\\", "/").lower()
         self._arm_nudge_smoothed = {}
+        self._toe_lift_smoothed = 0.0
 
         device = _resolve_torch_device(torch_device)
         self._set_kinematics_device(device)
@@ -343,12 +344,46 @@ class OnlineQposPostprocessor:
             gain = (fz_p - fz) / 0.02
             if abs(gain) < 1e-4:
                 continue
+            # Apply only a fraction of the correction per frame so the sole eases
+            # onto the ground instead of snapping flat (blend < 1 = gradual).
             dtheta = float(np.clip(-fz / gain, -max_step, max_step))
             new = float(np.clip(float(q[7 + dof]) + dtheta * blend, lower[dof], upper[dof]))
             q[7 + dof] = new
             # Re-forward so the next foot sees the updated pose.
             d.qpos[:] = q
             self._mj.mj_forward(m, d)
+        return q
+
+    def _correct_toe_penetration(self, q, target_clearance=0.001, max_lift=0.01, blend=0.25):
+        """Lift the root just enough to clear a toe that still digs below the floor.
+
+        ``height_adjust`` grounds the lowest *body frame* (the ankle) with a fixed
+        sole offset measured at the neutral pose, and ``_flatten_stance_feet``
+        levels the planted foot, but a foot that is still tilted a few degrees --
+        or whose sole mesh extends below the frame more than the neutral offset --
+        leaves the toe a few mm underground (the "微微穿模" look).  We measure the
+        actual lowest sole-mesh vertex and lift the root by that amount, bounded
+        so a deep squat (where the ankle is already at its toe-up limit and the
+        toe is ~6 cm down) is not floated up to hide a hardware range limit.
+
+        The lift is deliberately *slow* (small blend) and targets just clearing
+        the floor (not the neutral 5 mm design gap), so the body eases up a few
+        mm instead of popping -- a fast lift reads as the toe snapping to the
+        ground ("脚尖突然贴地")."""
+        if not self._foot_pitch_chain or self.sole_offset <= 0:
+            return q
+        m, d = self._get_mj_model()
+        d.qpos[:] = q
+        self._mj.mj_forward(m, d)
+        lowest = min(self._sole_lowest_z(m, d, c["foot_body"]) for c in self._foot_pitch_chain)
+        dz = 0.0
+        if lowest < target_clearance:
+            dz = float(np.clip(target_clearance - lowest, 0.0, max_lift))
+        # Slow exponential smoothing so the lift eases in/out instead of snapping.
+        self._toe_lift_smoothed = blend * dz + (1.0 - blend) * self._toe_lift_smoothed
+        if abs(self._toe_lift_smoothed) < 1e-5:
+            self._toe_lift_smoothed = 0.0
+        q[2] += self._toe_lift_smoothed
         return q
 
     def _arm_obstacles(self, c):
@@ -532,6 +567,10 @@ class OnlineQposPostprocessor:
             # After grounding, flatten each planted foot so its sole is parallel to
             # the ground (fixes heel-hover / toe-dig from a toe-down WHAM estimate).
             self._flatten_stance_feet(q)
+
+            # Nudge the root up by any residual toe penetration the flatten could
+            # not rotate away (a few mm), bounded so a deep squat is not floated.
+            self._correct_toe_penetration(q)
 
             # Keep the forearms clear of the thighs (fixes hand/forearm clipping the
             # hip during sit->stand when the arms hang by the side).

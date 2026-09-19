@@ -94,6 +94,7 @@ dist/
 .env
 .env.local
 .env.*.local
+.venv_mp/
 
 # Jupyter
 .ipynb_checkpoints/

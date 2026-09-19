@@ -470,6 +470,8 @@ def run_stream_mt(
     device = cfg.DEVICE.lower()
     is_cuda_device = str(device).startswith('cuda') and torch.cuda.is_available()
     use_amp = env_flag('WHAM_USE_AMP', True) and is_cuda_device
+    use_mediapipe = env_flag('WHAM_USE_MEDIAPIPE', False)
+    use_yolopose = env_flag('WHAM_USE_YOLOPOSE', False)
     detect_interval = max(1, int(os.environ.get('WHAM_DETECT_INTERVAL', '2')))
     infer_interval = max(1, int(os.environ.get('WHAM_INFER_INTERVAL', '1')))
     stream_seq_len = max(4, int(os.environ.get('WHAM_STREAM_SEQ_LEN', str(STREAM_SEQ_LEN))))
@@ -531,12 +533,32 @@ def run_stream_mt(
     )
     pose_model_ckpt = os.path.join(root_dir, 'checkpoints', 'vitpose_base_coco_aic_mpii.pth')
     bbox_model_ckpt = os.path.join(root_dir, 'checkpoints', 'yolov8n.pt')
-    detector = DetectionModel(
-        device,
-        pose_model_cfg=pose_model_cfg,
-        pose_model_ckpt=pose_model_ckpt,
-        bbox_model_ckpt=bbox_model_ckpt,
-    )
+    if use_yolopose:
+        # Single-stage YOLOv8-pose: bbox + 17 COCO keypoints in one ~27 ms
+        # forward (vs ~72.7 ms for YOLOv8n + ViTPose), same COCO keypoint
+        # distribution WHAM was trained on.
+        from scripts.yolopose_detector import YOLOPoseDetector
+        yolopose_ckpt = os.environ.get(
+            'WHAM_YOLOPOSE_CKPT',
+            os.path.join(root_dir, 'checkpoints', 'yolov8n-pose.pt'),
+        )
+        detector = YOLOPoseDetector(device, model_ckpt=yolopose_ckpt)
+        detect_interval = 1
+        logger.info(f"Using YOLOv8-pose (single-stage) detector: {yolopose_ckpt}")
+    elif use_mediapipe:
+        # CPU BlazePose detector in a separate .venv_mp subprocess — frees the
+        # GPU for the WHAM thread (removes the YOLO+ViTPose GPU contention).
+        from scripts.mp_proxy import MediaPipeDetectorProxy
+        detector = MediaPipeDetectorProxy()
+        detect_interval = 1  # BlazePose tracks internally; run every frame
+        logger.info("Using MediaPipe (CPU) detector via .venv_mp subprocess")
+    else:
+        detector = DetectionModel(
+            device,
+            pose_model_cfg=pose_model_cfg,
+            pose_model_ckpt=pose_model_ckpt,
+            bbox_model_ckpt=bbox_model_ckpt,
+        )
     extractor = FeatureExtractor(device, cfg.FLIP_EVAL)
     smpl = build_body_model('cpu')
     network = build_network(cfg, smpl)
@@ -2441,6 +2463,11 @@ def run_stream_mt(
                 logger.info(f"{name} thread still running during fast-stop; continue shutdown.")
             else:
                 logger.warning(f"{name} thread did not exit in time; continue shutdown.")
+    if use_mediapipe or use_yolopose:
+        try:
+            detector.close()
+        except Exception as e:
+            logger.warning(f"detector close failed: {e}")
     if terminal_listener is not None and terminal_listener.is_alive():
         stop_event.set()
         terminal_listener.join(timeout=0.5)

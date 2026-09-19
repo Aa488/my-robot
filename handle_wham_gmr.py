@@ -1253,27 +1253,33 @@ def run_stream_mt(
                 init_root = hist['cached_init_root']
 
                 try:
-                    _t_infer0 = time.perf_counter()
-                    with torch.inference_mode():
-                        with autocast_ctx():
-                            pred = network(
-                                norm_kp2d,
-                                inits,
-                                feature_t,
-                                mask=mask,
-                                init_root=init_root,
-                                cam_angvel=cam_angvel,
-                                return_y_up=True,
-                                cam_intrinsics=intrinsics_batch,
-                                bbox=bbox_t.unsqueeze(0).to(device, non_blocking=True),
-                                res=res_batch,
-                                refine_traj=False,
-                                states=None
-                            )
-                    _t_infer_ms = (time.perf_counter() - _t_infer0) * 1000
+                    stream_ctx = torch.cuda.stream(wham_stream) if wham_stream is not None else nullcontext()
+                    with stream_ctx:
+                        if wham_stream is not None:
+                            # Order WHAM's kernels after the detector/extractor work
+                            # (feature, inits, norm_kp2d all live on stream 0).
+                            wham_stream.wait_stream(torch.cuda.default_stream())
+                        _t_infer0 = time.perf_counter()
+                        with torch.inference_mode():
+                            with autocast_ctx():
+                                pred = network(
+                                    norm_kp2d,
+                                    inits,
+                                    feature_t,
+                                    mask=mask,
+                                    init_root=init_root,
+                                    cam_angvel=cam_angvel,
+                                    return_y_up=True,
+                                    cam_intrinsics=intrinsics_batch,
+                                    bbox=bbox_t.unsqueeze(0).to(device, non_blocking=True),
+                                    res=res_batch,
+                                    refine_traj=False,
+                                    states=None
+                                )
+                        _t_infer_ms = (time.perf_counter() - _t_infer0) * 1000
 
-                    verts_cam = extract_latest_vertices(pred).detach().cpu().numpy()
-                    smplx_params = extract_latest_smplx_params(pred)
+                        verts_cam = extract_latest_vertices(pred).detach().cpu().numpy()
+                        smplx_params = extract_latest_smplx_params(pred)
                     if frame_id % 10 == 0:
                         logger.info(f"[WHAM] infer_ms={_t_infer_ms:.1f}  frame={frame_id}")
                     hist['last_pred'] = (verts_cam.copy(), {k: v.copy() for k, v in smplx_params.items()})
@@ -1300,6 +1306,15 @@ def run_stream_mt(
                         continue
                 if frame_id == 0 or frame_id % heartbeat_frames == 0:
                     logger.warning(f"[WHAM] frame={frame_id} skipped because no tracked person; wham_Q={safe_qsize(wham_Q)}")
+
+    # Dedicated CUDA stream for the WHAM network.  The forward still contains a
+    # few `.item()`-style syncs (down to ~3 after the smplx patch); on the shared
+    # default stream each of those drains EVERYTHING the detector/extractor have
+    # queued, inflating infer_ms to 78-148 ms.  On its own stream they only drain
+    # WHAM's own ~45 ms of kernels.  Disable with WHAM_DEDICATED_STREAM=0.
+    wham_stream = None
+    if is_cuda_device and os.environ.get("WHAM_DEDICATED_STREAM", "1") != "0":
+        wham_stream = torch.cuda.Stream()
 
     t1 = threading.Thread(target=lambda: guarded_thread("reader", reader_thread), daemon=True, name="reader")
     t2 = threading.Thread(target=lambda: guarded_thread("detector", detector_thread), daemon=True, name="detector")
@@ -1451,7 +1466,17 @@ def run_stream_mt(
             logger.info(f"[GMR] source-feet dump opened: robot={robot_key} path={source_feet_path}")
         
     def tail_params_to_smplx_frame(params):
-        _dev = torch.device(gmr_args.torch_device) if gmr_args and gmr_args.torch_device != "cpu" else torch.device("cpu")
+        # Run the SMPL-X forward on GPU when available.  The full LBS forward
+        # (10475 verts) is ~30 ms on CPU vs ~2-3 ms on GPU, and it only needs the
+        # 127 joints — it does NOT depend on the postprocessor's KinematicsModel
+        # (the CUDA/NVRTC limitation), so it stays on GPU even while the
+        # postprocessor runs on CPU.  Disable with GMR_SMPLX_GPU=0.
+        if os.environ.get("GMR_SMPLX_GPU", "1") != "0" and torch.cuda.is_available():
+            _dev = torch.device("cuda")
+        elif gmr_args and str(gmr_args.torch_device) != "cpu":
+            _dev = torch.device(gmr_args.torch_device)
+        else:
+            _dev = torch.device("cpu")
 
         if gmr_state["tail_body_model"] is None:
             bm = smplx.create(
@@ -1463,7 +1488,12 @@ def run_stream_mt(
             bm = bm.to(_dev)
             gmr_state["tail_body_model"] = bm
             gmr_state["tail_joint_names"] = JOINT_NAMES[:len(bm.parents)]
-            gmr_state["tail_parents"] = bm.parents
+            # Store parents as a plain Python list.  `bm.parents` is a CUDA buffer
+            # once the model is on GPU, and indexing it (parents[i]) in the rotation
+            # chain below would otherwise call .item() -> a device->host sync on the
+            # default stream for every one of the 126 joints, every frame.
+            _parents = bm.parents
+            gmr_state["tail_parents"] = _parents.detach().cpu().tolist() if torch.is_tensor(_parents) else list(_parents)
 
         bm = gmr_state["tail_body_model"]
         jnames = gmr_state["tail_joint_names"]
@@ -1478,7 +1508,20 @@ def run_stream_mt(
 
         betas = _align_tail_betas(params["betas"], bm)
 
-        with torch.no_grad():
+        # Run on a dedicated CUDA stream so the device->host copies below do NOT
+        # sync the default stream (shared by the detector/extractor threads).  On
+        # the default stream, the first .cpu() would wait for their in-flight
+        # ViT/YOLO forwards and cancel the GPU win from moving this forward off
+        # the CPU (~30 ms).
+        stream = None
+        if _dev.type == "cuda":
+            stream = gmr_state.get("tail_body_stream")
+            if stream is None:
+                stream = torch.cuda.Stream()
+                gmr_state["tail_body_stream"] = stream
+
+        stream_ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
+        with torch.no_grad(), stream_ctx:
             s_out = bm(
                 betas=torch.from_numpy(betas).float().to(_dev).view(1, -1),
                 global_orient=torch.from_numpy(rorient).float().to(_dev),
@@ -1491,10 +1534,16 @@ def run_stream_mt(
                 reye_pose=torch.zeros(1, 3).float().to(_dev),
                 return_full_pose=True,
             )
+            so_cpu = s_out.global_orient[0].detach().cpu()
+            fp_cpu = s_out.full_pose[0].detach().cpu()
+            sj_cpu = s_out.joints[0].detach().cpu()
 
-        so = s_out.global_orient[0].detach().cpu().numpy()
-        fp = s_out.full_pose[0].detach().cpu().numpy().reshape(-1, 3)
-        sj = s_out.joints[0].detach().cpu().numpy()
+        if stream is not None:
+            stream.synchronize()
+
+        so = so_cpu.numpy()
+        fp = fp_cpu.numpy().reshape(-1, 3)
+        sj = sj_cpu.numpy()
 
         res = {}
         jorients = []

@@ -285,22 +285,39 @@ class OnlineQposPostprocessor:
 
     def _sole_lowest_z(self, m, d, body_name):
         """Lowest world z of a body's visual (group 0) mesh vertices."""
-        bid = self._mj_body_id(body_name)
         zmin = float("inf")
-        for g in range(m.ngeom):
-            if m.geom_bodyid[g] != bid:
-                continue
-            if m.geom_type[g] != self._mj.mjtGeom.mjGEOM_MESH:
-                continue
-            if m.geom_group[g] != 0:
-                continue
-            mid = m.geom_dataid[g]
-            start = m.mesh_vertadr[mid]
-            count = m.mesh_vertnum[mid]
-            verts = m.mesh_vert[start:start + count]
+        for g, verts in self._sole_geoms(body_name, m):
             w = verts @ d.geom_xmat[g].reshape(3, 3).T + d.geom_xpos[g]
             zmin = min(zmin, float(np.min(w[:, 2])))
         return zmin
+
+    def _sole_geoms(self, body_name, m):
+        """Mesh geoms (group 0) of a body, with local vertices, cached.
+
+        The set of mesh geoms on a body and their local vertex data are static
+        for the life of the model, but ``_sole_lowest_z`` is called ~4x/frame and
+        used to re-scan every ``m.ngeom`` and re-slice the mesh verts each time.
+        Cache both so the per-frame cost is just the world transform + min."""
+        cache = getattr(self, "_sole_geoms_cache", None)
+        if cache is None:
+            cache = self._sole_geoms_cache = {}
+        geoms = cache.get(body_name)
+        if geoms is None:
+            bid = self._mj_body_id(body_name)
+            geoms = []
+            for g in range(m.ngeom):
+                if m.geom_bodyid[g] != bid:
+                    continue
+                if m.geom_type[g] != self._mj.mjtGeom.mjGEOM_MESH:
+                    continue
+                if m.geom_group[g] != 0:
+                    continue
+                mid = m.geom_dataid[g]
+                start = m.mesh_vertadr[mid]
+                count = m.mesh_vertnum[mid]
+                geoms.append((g, m.mesh_vert[start:start + count].copy()))
+            cache[body_name] = geoms
+        return geoms
 
     def _dof_limits(self):
         if getattr(self, "_dof_lo", None) is None:
@@ -323,7 +340,7 @@ class OnlineQposPostprocessor:
             return q
         m, d = self._get_mj_model()
         d.qpos[:] = q
-        self._mj.mj_forward(m, d)
+        self._mj.mj_kinematics(m, d)
         lower, upper = self._dof_limits()
         for c in self._foot_pitch_chain:
             # Planted when the lowest point of the sole mesh is near the ground.
@@ -339,7 +356,7 @@ class OnlineQposPostprocessor:
             q_test = q.copy()
             q_test[7 + dof] += 0.02
             d.qpos[:] = q_test
-            self._mj.mj_forward(m, d)
+            self._mj.mj_kinematics(m, d)
             fz_p = float(d.xmat[bid].reshape(3, 3)[:, 0][2])
             gain = (fz_p - fz) / 0.02
             if abs(gain) < 1e-4:
@@ -351,7 +368,7 @@ class OnlineQposPostprocessor:
             q[7 + dof] = new
             # Re-forward so the next foot sees the updated pose.
             d.qpos[:] = q
-            self._mj.mj_forward(m, d)
+            self._mj.mj_kinematics(m, d)
         return q
 
     def _correct_toe_penetration(self, q, target_clearance=0.001, max_lift=0.01, blend=0.25):
@@ -374,7 +391,7 @@ class OnlineQposPostprocessor:
             return q
         m, d = self._get_mj_model()
         d.qpos[:] = q
-        self._mj.mj_forward(m, d)
+        self._mj.mj_kinematics(m, d)
         lowest = min(self._sole_lowest_z(m, d, c["foot_body"]) for c in self._foot_pitch_chain)
         dz = 0.0
         if lowest < target_clearance:
@@ -418,7 +435,7 @@ class OnlineQposPostprocessor:
         q_probe = qw.copy()
         q_probe[7 + dof] = new_val
         d.qpos[:] = q_probe
-        self._mj.mj_forward(m, d)
+        self._mj.mj_kinematics(m, d)
         a = d.xpos[self._mj_body_id(c["elbow_body"])]
         b = d.xpos[self._mj_body_id(c["wrist_body"])]
         pa, pb = obs
@@ -449,7 +466,7 @@ class OnlineQposPostprocessor:
             # Solve for the collision-free pose on a working copy of the pose.
             qw = q.copy()
             d.qpos[:] = qw
-            self._mj.mj_forward(m, d)
+            self._mj.mj_kinematics(m, d)
             for _ in range(max_iters):
                 dist, pa, pb = self._arm_clearance(d, c)
                 if dist >= clearance:
@@ -478,7 +495,7 @@ class OnlineQposPostprocessor:
                     break
                 qw[7 + dof] = new
                 d.qpos[:] = qw
-                self._mj.mj_forward(m, d)
+                self._mj.mj_kinematics(m, d)
             # Smooth the correction (offset from the raw pose) per joint so the
             # arm eases out/back gradually and switching joints stays smooth.
             for dof in c["arm_dofs"]:
@@ -488,7 +505,7 @@ class OnlineQposPostprocessor:
                 self._arm_nudge_smoothed[dof] = smoothed
                 q[7 + dof] = float(q[7 + dof]) + smoothed
         d.qpos[:] = q
-        self._mj.mj_forward(m, d)
+        self._mj.mj_kinematics(m, d)
         return q
 
     def _compute_sole_offset(self, clearance=0.005):

@@ -14,6 +14,11 @@ from smplx.lbs import vertices2joints
 
 from configs import constants as _C
 
+# Remove the per-joint .item() sync inside smplx.lbs.batch_rigid_transform
+# (see lib/models/smplx_patch.py).  Must run before the first SMPL forward.
+from lib.models.smplx_patch import patch_smplx_lbs
+patch_smplx_lbs()
+
 class SMPL(_SMPL):
     """ Extension of the official SMPL implementation to support more joints """
 

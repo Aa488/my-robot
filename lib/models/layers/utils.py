@@ -34,12 +34,18 @@ def reset_root_velocity(smpl, output, stationary, pred_ori, pred_vel, thr=0.7):
     stationary_mask = (stationary.clone().detach() > thr).unsqueeze(-1).float()
     poses_root = transforms.rotation_6d_to_matrix(pred_ori.clone().detach())
     vel_world = (poses_root[:, 1:] @ pred_vel.clone().detach().unsqueeze(-1)).squeeze(-1)
-    
-    output = smpl.get_output(body_pose=output.body_pose.clone().detach(),
-                             global_orient=poses_root[:, 1:].reshape(-1, 1, 3, 3),
-                             betas=output.betas.clone().detach(),
-                             pose2rot=False)
-    feet = output.feet.reshape(b, f, 4, 3)
+
+    # Feet under the trajectory-decoder root orientation, WITHOUT a second LBS
+    # forward.  LBS is a rigid transform in global_orient (no translation), so
+    # the feet computed by the first forward only rotate by  R2 @ R1^T, where
+    #   R1 = output.global_orient  (first forward's root, from pred_pose[:, :, :6])
+    #   R2 = poses_root[:, 1:]     (trajectory decoder's root)
+    # This is mathematically identical to re-running smpl.get_output with
+    # global_orient=R2, but costs one batched matmul instead of a full LBS pass.
+    r1 = output.global_orient.detach().reshape(b, f, 3, 3)
+    rot_delta = poses_root[:, 1:] @ r1.transpose(-1, -2)          # [b, f, 3, 3]
+    feet = output.feet.detach().reshape(b, f, 4, 3)               # [b, f, 4, 3]
+    feet = feet @ rot_delta.transpose(-1, -2)                     # [b, f, 4, 3]  (R applied to row-vector points)
     feet_vel = feet[:, 1:] - feet[:, :-1] + vel_world[:, 1:].unsqueeze(-2)
     feet_vel = torch.cat((torch.zeros_like(feet_vel[:, :1]), feet_vel), dim=1)
     

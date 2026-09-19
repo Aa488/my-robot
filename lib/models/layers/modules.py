@@ -134,7 +134,7 @@ class MotionEncoder(nn.Module):
         motion_context_list = []
         
         for i in range(self.f):
-            (pred_kp3d, ), motion_context, h0 = self.regressor(x[:, [i]], pred_list[-1:], h0)
+            (pred_kp3d, ), motion_context, h0 = self.regressor(x[:, i:i+1], pred_list[-1:], h0)
             motion_context_list.append(motion_context)
             pred_list.append(pred_kp3d)
             
@@ -171,7 +171,7 @@ class TrajectoryDecoder(nn.Module):
         for i in range(f):
             # Global coordinate estimation
             (pred_rootv, pred_rootr), _, h0 = self.regressor(
-                x[:, [i]], [pred_root_list[-1], cam_a[:, [i]]], h0)
+                x[:, i:i+1], [pred_root_list[-1], cam_a[:, i:i+1]], h0)
             
             pred_root_list.append(pred_rootr)
             pred_vel_list.append(pred_rootv)
@@ -215,7 +215,7 @@ class MotionDecoder(nn.Module):
         
         for i in range(f):
             # Camera coordinate estimation
-            (pred_pose, pred_shape, pred_cam, pred_contact), _, h0 = self.regressor(x[:, [i]], pred_pose_list[-1:], h0)
+            (pred_pose, pred_shape, pred_cam, pred_contact), _, h0 = self.regressor(x[:, i:i+1], pred_pose_list[-1:], h0)
             pred_pose_list.append(pred_pose)
             pred_shape_list.append(pred_shape)
             pred_cam_list.append(pred_cam)

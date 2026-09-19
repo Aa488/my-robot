@@ -101,6 +101,23 @@ def main():
     with torch.autograd.profiler.profile(use_cuda=True, with_stack=True) as prof:
         run_network()
 
+    def walk_syncs(events):
+        for e in events:
+            key = e.key.split("::")[-1]
+            if key in ("_local_scalar_dense", "item") and getattr(e, "self_cuda_time_total", 0.0) > 0:
+                print(f"=== {e.key}  count={e.count}  cuda={e.self_cuda_time_total/1000:.3f} ms ===")
+                for fr in getattr(e, "stack", None) or []:
+                    if isinstance(fr, (tuple, list)):
+                        fn = str(fr[0]).replace(ROOT + os.sep, "")
+                        print(f"     {fn}:{fr[1]}  {fr[2]}")
+                    else:
+                        print(f"     {fr}")
+                print()
+            walk_syncs(getattr(e, "cpu_children", []))
+
+    print("\n[deep] FULL stacks for remaining sync ops (_local_scalar_dense / item):\n")
+    walk_syncs(prof.function_events)
+
     targets = {"_local_scalar_dense", "item", "copy_", "to", "_to_copy", "_cudnn_rnn"}
     print("\n[deep] call sites for the sync/copy ops (top-6 stack frames each):\n")
     for e in prof.key_averages(group_by_stack_n=6):

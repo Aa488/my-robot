@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import os.path as osp
 from collections import defaultdict
 
@@ -11,6 +12,12 @@ import scipy.signal as signal
 from progress.bar import Bar
 
 from ultralytics import YOLO
+
+# The ViT backbone only exists in the bundled ViTPose fork (third-party/ViTPose),
+# not the PyPI mmpose 0.24. Put the fork first on sys.path so `import mmpose`
+# resolves to it.
+sys.path.insert(0, osp.abspath(f"{__file__}/../../../../third-party/ViTPose"))
+
 from mmpose.apis import (
     inference_top_down_pose_model,
     init_pose_model,

@@ -1,27 +1,54 @@
-# Dockerignore
+# ---- never enter the image -------------------------------------------------
 
+# git / editor / python caches
 .git
+**/.git
+**/.git/
 .gitignore
+.gitmodules
 .vscode
-__pycache__/
+.venv_mp
+.cache
+.claude
 **/__pycache__/
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
+**/.ipynb_checkpoints/
+**/*.egg-info/
+
+# logs
 *.log
 
-checkpoints/
-assets/
-dataset/
-examples/
-docs/
+# secrets — Tencent Cloud credentials, MUST NOT ship
+examples/SecretKey.csv
 
+# run artifacts / outputs
 output/
+outputs/
 pkl_outputs/
 videos/
-*.ipynb_checkpoints
+submit/
+submit.rar
+submit.zip
 
+# optional SLAM (not imported by the streaming pipeline)
 third-party/DPVO/
 
-**/.git/
-**/*.egg-info/
+# ---- large files not needed at inference -----------------------------------
+
+# DPVO SLAM weight (offline demo.py only)
+checkpoints/dpvo.pth
+# ViTPose-huge (2.5G) and YOLOv8x (136M) — the pipeline uses ViTPose-base + YOLOv8n
+checkpoints/vitpose-h-multi-coco.pth
+checkpoints/yolov8x.pt
+checkpoints/yolov8s-pose.pt
+
+# SMPL-X -> SMPL conversion matrix (578M) — evaluation only, not the live pipeline
+dataset/body_models/smplx2smpl.pkl
+dataset/body_models/__MACOSX/
+dataset/body_models/smpl/__MACOSX/
+
+# large demo gif tracked via LFS
+docs/video/

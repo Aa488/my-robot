@@ -170,6 +170,7 @@ $LEGACY_RECORD_VIDEO  = _env RECORD_VIDEO   "0"
 $RECORD_WHAMVIDEO     = _env RECORD_WHAMVIDEO $LEGACY_RECORD_VIDEO
 $RECORD_GMRVIDEO      = _env RECORD_GMRVIDEO  $LEGACY_RECORD_VIDEO
 $USE_XVFB_GMR         = _env USE_XVFB_GMR     "0"
+$WHAM_PREVIEW         = _env WHAM_PREVIEW     ""
 
 $OUTPUT_ROOT    = _env OUTPUT_ROOT ""
 if ($OUTPUT_ROOT) {
@@ -206,6 +207,10 @@ $WHAM_INFER_INTERVAL   = _env WHAM_INFER_INTERVAL   "1"
 $WHAM_STREAM_SEQ_LEN   = _env WHAM_STREAM_SEQ_LEN   "16"
 $WHAM_INPUT_SCALE      = _env WHAM_INPUT_SCALE      "1.0"
 $WHAM_DEDICATED_STREAM = _env WHAM_DEDICATED_STREAM "1"
+# Webcam-only bounded backlog (frames kept before dropping stale ones): higher =
+# smoother trajectory, lower = lower latency. 0 via WHAM_LATEST_FRAME disables.
+$WHAM_LATEST_FRAME      = _env WHAM_LATEST_FRAME      "1"
+$WHAM_LATEST_FRAME_KEEP = _env WHAM_LATEST_FRAME_KEEP "3"
 $env:WHAM_USE_AMP         = $WHAM_USE_AMP
 $env:WHAM_USE_MEDIAPIPE   = $WHAM_USE_MEDIAPIPE
 $env:WHAM_USE_YOLOPOSE    = $WHAM_USE_YOLOPOSE
@@ -215,6 +220,9 @@ $env:WHAM_INFER_INTERVAL  = $WHAM_INFER_INTERVAL
 $env:WHAM_STREAM_SEQ_LEN  = $WHAM_STREAM_SEQ_LEN
 $env:WHAM_INPUT_SCALE     = $WHAM_INPUT_SCALE
 $env:WHAM_DEDICATED_STREAM = $WHAM_DEDICATED_STREAM
+$env:WHAM_PREVIEW         = $WHAM_PREVIEW
+$env:WHAM_LATEST_FRAME    = $WHAM_LATEST_FRAME
+$env:WHAM_LATEST_FRAME_KEEP = $WHAM_LATEST_FRAME_KEEP
 
 $GMR_TORCH_DEVICE                     = _env GMR_TORCH_DEVICE                     "cpu"
 $GMR_VIEWER_READY_TIMEOUT_SEC         = _env GMR_VIEWER_READY_TIMEOUT_SEC         "8"
@@ -269,9 +277,9 @@ Remove-Item -Force -ErrorAction SilentlyContinue $GMR_READY_FLAG
 Remove-Item -Force -ErrorAction SilentlyContinue $STREAM_TAIL_PATH
 
 $_display = if ($env:DISPLAY) { $env:DISPLAY } else { '<unset>' }
-Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO TCP=$TCP USE_XVFB_GMR=$USE_XVFB_GMR DISPLAY=$_display"
+Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO TCP=$TCP USE_XVFB_GMR=$USE_XVFB_GMR WHAM_PREVIEW=$(if ($WHAM_PREVIEW) { $WHAM_PREVIEW } else { '<follow-record>' }) DISPLAY=$_display"
 Write-Host "[E2E] Camera params: follow=$CAMERA_FOLLOW track=$TRACK lookat_h=$CAMERA_LOOKAT_HEIGHT_OFFSET elev=$CAMERA_ELEVATION dist_scale=$CAMERA_DISTANCE_SCALE azimuth=$(if ($CAMERA_AZIMUTH) { $CAMERA_AZIMUTH } else { '<auto>' })"
-Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP mediapipe=$WHAM_USE_MEDIAPIPE yolopose=$WHAM_USE_YOLOPOSE mp_complexity=$WHAM_MEDIAPIPE_COMPLEXITY detect_interval=$WHAM_DETECT_INTERVAL infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE dedicated_stream=$WHAM_DEDICATED_STREAM"
+Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP mediapipe=$WHAM_USE_MEDIAPIPE yolopose=$WHAM_USE_YOLOPOSE mp_complexity=$WHAM_MEDIAPIPE_COMPLEXITY detect_interval=$WHAM_DETECT_INTERVAL infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE dedicated_stream=$WHAM_DEDICATED_STREAM latest_frame=$WHAM_LATEST_FRAME latest_frame_keep=$WHAM_LATEST_FRAME_KEEP"
 Write-Host "[E2E] WHAM stream mode=tail (fixed)"
 Write-Host "[E2E] GMR torch_device=$GMR_TORCH_DEVICE"
 Write-Host "[E2E] Source params: VIDEO=$VIDEO TIME=$TIME ROBOT=$ROBOT ROBOTS=$ROBOTS OUTPUT_ROOT=$(if ($OUTPUT_ROOT) { $OUTPUT_ROOT } else { '<default>' }) CSV_PATH=$CSV_PATH CSV_ROOT=$CSV_ROOT TCP=$TCP"

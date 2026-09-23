@@ -494,7 +494,16 @@ def run_stream_mt(
     webcam_capture_time = max(0.0, float(capture_time))
     webcam_start_ts = None
     preview_window_name = 'WHAM Stream'
-    preview_window_enabled = bool(record_whamvideo)
+    # Preview window: shows the WHAM-visualized input (FPS/Latency text, plus
+    # mesh overlay only when recording). Defaults to following record_whamvideo
+    # for backward compatibility. Override independently with WHAM_PREVIEW=1
+    # (show the feed without recording) or WHAM_PREVIEW=0 (record headlessly).
+    # Requires a DISPLAY (on headless Linux it is auto-disabled).
+    _preview_raw = os.environ.get("WHAM_PREVIEW")
+    if _preview_raw is not None and str(_preview_raw).strip() != "":
+        preview_window_enabled = env_flag("WHAM_PREVIEW", True)
+    else:
+        preview_window_enabled = bool(record_whamvideo)
     preview_max_w = max(320, int(os.environ.get('WHAM_PREVIEW_MAX_WIDTH', '960')))
     preview_max_h = max(240, int(os.environ.get('WHAM_PREVIEW_MAX_HEIGHT', '540')))
     logger.info(
@@ -669,12 +678,55 @@ def run_stream_mt(
     render_Q = Queue(maxsize=max(2, int(os.environ.get('WHAM_RENDER_QUEUE_SIZE', '16'))))
     render_thread = None
     render_drop_count = 0
+    # Frames dropped by the front-of-pipeline latest-frame drain (webcam only),
+    # incremented from the detector/wham threads so it lives in a mutable list.
+    upstream_drop_count = [0]
 
     def safe_qsize(q):
         try:
             return q.qsize()
         except Exception:
             return -1
+
+    # Webcam-only bounded backlog: instead of replaying the full pipeline queue
+    # (maxsize 10) worth of stale frames — or, at the other extreme, dropping
+    # everything but the very latest (which starves WHAM's temporal window and
+    # makes the trajectory jittery) — cap the backlog to a small window. Frames
+    # still flow through in FIFO order (dense trajectory), just with a bounded
+    # lag of `latest_frame_keep` frames. Tune up for smoother motion / down for
+    # lower latency. Opt out entirely with WHAM_LATEST_FRAME=0.
+    latest_frame_keep = max(1, int(os.environ.get("WHAM_LATEST_FRAME_KEEP", "3")))
+
+    def _cap_queue_backlog(q, keep, drop_counter):
+        """Drop the oldest frames in `q` until at most `keep` (the newest) remain.
+
+        The caller has already popped the frame it is about to process; this
+        bounds the frames still queued behind it so the backlog never grows past
+        `keep`. The stop sentinel (None) is left in place so shutdown propagates.
+        """
+        drained = []
+        while True:
+            try:
+                nxt = q.get_nowait()
+            except Empty:
+                break
+            if nxt is None:
+                try:
+                    q.put(nxt, timeout=0.1)
+                except Full:
+                    pass
+                break
+            drained.append(nxt)
+
+        overflow = len(drained) - keep
+        if overflow > 0:
+            drop_counter[0] += overflow
+            drained = drained[-keep:]
+        for item in drained:
+            try:
+                q.put(item, timeout=0.1)
+            except Full:
+                drop_counter[0] += 1
 
     thread_failure_lock = threading.Lock()
     thread_failure = {"message": None}
@@ -1036,6 +1088,16 @@ def run_stream_mt(
                 except Exception:
                     pass
                 break
+
+            # Real-time (webcam only): the reader runs at camera rate (~30fps)
+            # while detection is the bottleneck, so read_Q backs up with frames
+            # that are already stale by the time they reach the detector. Cap the
+            # backlog to a small window so detection doesn't replay a long queue,
+            # while keeping a few frames in FIFO order for a dense trajectory.
+            # Disabled for file video; opt out with WHAM_LATEST_FRAME=0.
+            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
+                _cap_queue_backlog(read_Q, latest_frame_keep, upstream_drop_count)
+
             frame_id, start_time, frame = data
 
             track_id = None
@@ -1190,8 +1252,15 @@ def run_stream_mt(
                 except Exception:
                     pass
                 break
+
+            # Real-time (webcam only): same bounded-backlog cap as the detector,
+            # but at WHAM's input — if WHAM inference is the bottleneck relative
+            # to the extractor, ext_Q backs up with stale frames.
+            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
+                _cap_queue_backlog(ext_Q, latest_frame_keep, upstream_drop_count)
+
             frame_id, start_time, frame, track_id, kp2d, bbox_c, feature, init_data = data
-            
+
             if track_id is not None:
                 if track_id not in temporal_history:
                     temporal_history[track_id] = {
@@ -1314,7 +1383,10 @@ def run_stream_mt(
     # WHAM's own ~45 ms of kernels.  Disable with WHAM_DEDICATED_STREAM=0.
     wham_stream = None
     if is_cuda_device and os.environ.get("WHAM_DEDICATED_STREAM", "1") != "0":
-        wham_stream = torch.cuda.Stream()
+        # priority=-1 = high priority: WHAM's kernels get scheduled ahead of the
+        # detector/extractor's default-stream kernels, so WHAM's tail latency isn't
+        # starved when YOLOv8n + ViTPose contend for the same card.
+        wham_stream = torch.cuda.Stream(priority=-1)
 
     t1 = threading.Thread(target=lambda: guarded_thread("reader", reader_thread), daemon=True, name="reader")
     t2 = threading.Thread(target=lambda: guarded_thread("detector", detector_thread), daemon=True, name="detector")
@@ -1338,7 +1410,7 @@ def run_stream_mt(
     t4.start()
     if terminal_listener is not None:
         terminal_listener.start()
-    if record_whamvideo:
+    if record_whamvideo or preview_window_enabled:
         render_thread = threading.Thread(
             target=lambda: guarded_thread("wham-render", render_thread_worker),
             daemon=True,
@@ -1786,8 +1858,16 @@ def run_stream_mt(
     _t_gmr_post = deque(maxlen=30)   # post-processing (ms)
     _t_wham_q   = deque(maxlen=30)   # wham_Q.get wait time (ms)
     _t_adapt    = deque(maxlen=30)   # adaptation layer (ms)
+    _t_e2e      = deque(maxlen=300)  # end-to-end capture->joint-angle latency (ms)
     last_gmr_preview_render_time = 0.0
-    gmr_worker_queue_size = max(1, int(os.environ.get("GMR_WORKER_QUEUE_SIZE", "1")))
+    if is_webcam:
+        # Webcam (real-time): size-1 drop-to-latest so IK always acts on the
+        # freshest frame, trading throughput for low tracking latency.
+        gmr_worker_queue_size = max(1, int(os.environ.get("GMR_WORKER_QUEUE_SIZE", "1")))
+    else:
+        # File video: keep every frame (no drop-to-latest) so the offline CSV and
+        # robot video stay complete. 0 = unbounded queue.
+        gmr_worker_queue_size = max(0, int(os.environ.get("GMR_WORKER_QUEUE_SIZE", "0")))
 
     def _clone_smplx_frame(src):
         return {
@@ -1798,12 +1878,12 @@ def run_stream_mt(
             for key, value in src.items()
         }
 
-    def _enqueue_latest_gmr_task(state, frame_id, sf, betas):
+    def _enqueue_latest_gmr_task(state, frame_id, start_time, sf, betas):
         q = state.get("worker_queue")
         if q is None:
             return
 
-        task = (int(frame_id), _clone_smplx_frame(sf), None if betas is None else np.asarray(betas).copy())
+        task = (int(frame_id), float(start_time), _clone_smplx_frame(sf), None if betas is None else np.asarray(betas).copy())
         try:
             q.put_nowait(task)
             return
@@ -1954,7 +2034,7 @@ def run_stream_mt(
         if wr > 0.0:
             rf[2] = (rz + flat) * wr + float(rf[2]) * (1.0 - wr)
 
-    def _process_gmr_worker_frame(state, frame_id, sf, betas):
+    def _process_gmr_worker_frame(state, frame_id, start_time, sf, betas):
         robot_key = state["robot"]
         init_gmr_state(state, betas, create_viewer=False)
 
@@ -2045,6 +2125,14 @@ def run_stream_mt(
         _t_gmr_ik.append(ik_ms)
         _t_gmr_post.append(post_ms)
 
+        # End-to-end tracking latency: frame capture (reader timestamp) -> joint
+        # angles written (t_output). start_time is wall-clock time.time() stamped
+        # in the reader thread, so time.time() - start_time is the true
+        # capture->output latency including all upstream queue dwell.
+        e2e_ms = (time.time() - start_time) * 1000
+        _t_e2e.append(e2e_ms)
+        state["last_e2e_ms"] = e2e_ms
+
         if state["csv_row_count"] == 1 or frame_id % heartbeat_frames == 0:
             logger.info(
                 f"[GMR] wrote CSV row={state['csv_row_count']} frame={frame_id} robot={robot_key} "
@@ -2062,9 +2150,9 @@ def run_stream_mt(
                 continue
             if task is None:
                 break
-            frame_id, sf, betas = task
+            frame_id, start_time, sf, betas = task
             try:
-                _process_gmr_worker_frame(state, frame_id, sf, betas)
+                _process_gmr_worker_frame(state, frame_id, start_time, sf, betas)
             except KeyboardInterrupt:
                 terminal_stop_event.set()
                 stop_event.set()
@@ -2098,6 +2186,9 @@ def run_stream_mt(
 
     prev_sigint = signal.signal(signal.SIGINT, _on_sigint)
 
+    # Stale WHAM frames skipped by the latest-frame drain (real-time only).
+    main_drop_count = 0
+
     while True:
         try:
             _t0_q = time.perf_counter()
@@ -2118,6 +2209,30 @@ def run_stream_mt(
 
         if res_data is None:
             break
+
+        # Real-time (webcam only): WHAM can run ahead of the downstream
+        # GMR/render path, so wham_Q may hold several already-stale frames.
+        # Drain to the latest frame (mirroring the GMR worker's size-1
+        # drop-to-latest) so IK always acts on the freshest observation instead
+        # of replaying a backlog. Trades throughput (dropped frames) for low
+        # tracking latency. Disabled for file video so offline playback keeps
+        # every frame. Opt out with WHAM_LATEST_FRAME=0.
+        if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
+            while True:
+                try:
+                    nxt = wham_Q.get_nowait()
+                except Empty:
+                    break
+                if nxt is None:
+                    # Stop sentinel: push it back so the loop still exits cleanly.
+                    try:
+                        wham_Q.put(nxt, timeout=0.1)
+                    except Full:
+                        pass
+                    break
+                res_data = nxt
+                main_drop_count += 1
+
         frame_id, start_time, frame, success, verts_cam, pred_track_id, gvhmr_params = res_data
         max_frame_id = max(max_frame_id, frame_id)
 
@@ -2210,7 +2325,7 @@ def run_stream_mt(
                 _t_adapt.append((time.perf_counter() - _t0_adapt) * 1000)
 
                 for state in gmr_states.values():
-                    _enqueue_latest_gmr_task(state, frame_id, sf, bt)
+                    _enqueue_latest_gmr_task(state, frame_id, start_time, sf, bt)
 
                 now_for_preview = time.time()
                 render_gmr_preview_this_frame = (
@@ -2316,14 +2431,18 @@ def run_stream_mt(
             mean_post = float(np.mean(_t_gmr_post)) if len(_t_gmr_post) else 0.0
             mean_adapt = float(np.mean(_t_adapt)) if len(_t_adapt) else 0.0
             mean_wham_wait = float(np.mean(_t_wham_q)) if len(_t_wham_q) else 0.0
+            e2e_vals = list(_t_e2e)
+            e2e_avg = float(np.mean(e2e_vals)) if e2e_vals else 0.0
+            e2e_p95 = float(np.percentile(e2e_vals, 95)) if len(e2e_vals) >= 20 else (float(np.max(e2e_vals)) if e2e_vals else 0.0)
             logger.info(
                 f"[Heartbeat] frame={frame_id} wham_fps={avg_fps:.2f} latency={latency:.2f}s "
-                f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)} "
+                f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)} main_drop={main_drop_count} front_drop={upstream_drop_count[0]} "
                 f"adapt_ms={mean_adapt:.1f} ik_ms={mean_ik:.1f} post_ms={mean_post:.1f} wham_wait_ms={mean_wham_wait:.1f} "
+                f"e2e_avg_ms={e2e_avg:.1f} e2e_p95_ms={e2e_p95:.1f} "
                 f"gmr_preview_fps={gmr_preview_fps:.2f} {robot_rows}"
             )
         
-        if record_whamvideo:
+        if record_whamvideo or preview_window_enabled:
             if success and verts_cam is not None:
                 # Render using WHAM Renderer
                 if renderer is not None:
@@ -2343,16 +2462,24 @@ def run_stream_mt(
             frame_out = sanitize_preview_frame(frame)
             # Feed the render thread for video encoding + preview window
             packet = (frame_out.copy(), float(curr_time))
-            try:
-                render_Q.put(packet, timeout=0.01)
-            except Full:
+            if is_webcam:
                 try:
-                    _ = render_Q.get_nowait()
-                    render_drop_count += 1
-                except Empty:
-                    pass
+                    render_Q.put(packet, timeout=0.01)
+                except Full:
+                    try:
+                        _ = render_Q.get_nowait()
+                        render_drop_count += 1
+                    except Empty:
+                        pass
+                    try:
+                        render_Q.put_nowait(packet)
+                    except Full:
+                        render_drop_count += 1
+            else:
+                # File video: backpressure instead of dropping so the output WHAM
+                # video keeps every frame (block until the encoder drains).
                 try:
-                    render_Q.put_nowait(packet)
+                    render_Q.put(packet, timeout=5.0)
                 except Full:
                     render_drop_count += 1
 

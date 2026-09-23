@@ -1,11 +1,16 @@
-ARG CUDA_BASE_IMAGE=nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# WHAM -> GMR integrated pipeline, single-env image matching the Windows dev machine
+# (`wham_gmr`: Python 3.10 + torch 2.14.0+cu130). Self-contained: weights, body
+# models, robot assets and a demo video are baked in so the image tar runs out of the box.
+#
+# Build:  docker build -f docker/Dockerfile -t wham-gmr:latest .
+# Run:    docker run --gpus all --rm -v $PWD/out:/output wham-gmr:latest [video.mp4]
+
+ARG CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
     CONDA_DIR=/opt/conda \
-    PIP_DEFAULT_TIMEOUT=300 \
-    PIP_RETRIES=20 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1
 
@@ -29,11 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libegl1 \
     libglfw3 \
-    libglfw3-dev \
     libxi6 \
-    libxrandr2 \
-    libxxf86vm1 \
-    libxinerama1 \
     libosmesa6 \
     libosmesa6-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -42,48 +43,41 @@ RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-py310_24.1.2-0-Linux-
     bash /tmp/miniconda.sh -b -p ${CONDA_DIR} && \
     rm -f /tmp/miniconda.sh
 
-ENV PATH=${CONDA_DIR}/bin:${PATH}
-SHELL ["/bin/bash", "-lc"]
+# Point `python`/`pip` at the single runtime env (mirrors the dev `wham_gmr` env).
+ENV PATH=${CONDA_DIR}/envs/wham_gmr/bin:${CONDA_DIR}/bin:${PATH}
 
-RUN conda config --set always_yes yes --set changeps1 no && \
-    conda update -n base -c defaults conda && \
-    conda create -n wham python=3.9 && \
-    conda create -n gmr python=3.10 && \
-    conda clean -afy
+RUN conda create -n wham_gmr python=3.10 -y && conda clean -afy
 
+# torch + torchvision (cu130 wheels; only available on the pytorch cu130 index).
+RUN pip install --index-url https://download.pytorch.org/whl/cu130 \
+      --extra-index-url https://pypi.org/simple \
+      torch==2.14.0+cu130 torchvision==0.29.0+cu130
+
+# Build prerequisites before the C-extension packages: old setuptools (avoids the
+# mmcv/pkg_resources failure), cython, and numpy 1.23 (< 1.26 keeps numpy.distutils
+# for chumpy).
+RUN pip install "setuptools==59.5.0" "wheel<0.46" cython numpy==1.23.5
+
+# mmcv "light" (pure Python) — no-build-isolation avoids pkg_resources failure
+# with the pinned old setuptools.
+RUN pip install --no-build-isolation mmcv==1.3.9
+
+# C-extension packages (gcc from build-essential; numpy/cython from the step above).
+RUN pip install --no-build-isolation chumpy==0.70 xtcocotools==1.14.3
+
+# Remaining WHAM + GMR deps at the exact dev-env versions.
+COPY docker/requirements-linux.txt /tmp/requirements-linux.txt
+RUN pip install -r /tmp/requirements-linux.txt
+
+# Project source (weights / body models / robot assets / demo video included via
+# .dockerignore). Kept last so the heavy pip layers stay cached across source edits.
 WORKDIR /opt/src/wham
 COPY . /opt/src/wham
+# Files checked out on Windows have no exec bit; ENTRYPOINT exec-form needs it.
+RUN chmod +x /opt/src/wham/docker/entrypoint.sh
 
-# WHAM runtime environment
-RUN conda run -n wham pip install --upgrade "pip<26" "setuptools<81" "wheel<0.46" && \
-    conda run -n wham pip install --index-url https://download.pytorch.org/whl/cu118 \
-      torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 && \
-        conda run -n wham conda install -y -c conda-forge iopath && \
-        wget -q -O /tmp/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 \
-            https://conda.anaconda.org/pytorch3d/linux-64/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 && \
-        conda run -n wham conda install -y --no-deps /tmp/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 && \
-        rm -f /tmp/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 && \
-        conda run -n wham python -c "import pytorch3d" && \
-    conda run -n wham pip install --no-build-isolation -r requirements.txt && \
-    conda run -n wham pip install --no-build-isolation "chumpy==0.70" && \
-    conda run -n wham pip install json_tricks && \
-    conda run -n wham pip install --no-deps --no-build-isolation -v third-party/ViTPose
+ENV PYTHONPATH=/opt/src/wham \
+    WHAM_ENV=wham_gmr \
+    GMR_ENV=wham_gmr
 
-# GMR runtime environment
-RUN conda run -n gmr pip install --upgrade "pip<26" "setuptools<81" "wheel<0.46" && \
-    conda run -n gmr pip install --index-url https://download.pytorch.org/whl/cu118 \
-      torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 && \
-    conda run -n gmr pip install "numpy<2" && \
-    conda run -n gmr pip install -e . && \
-    conda run -n gmr pip install "numpy<2"
-
-# Optional: if you need full WHAM demo.py SLAM dependencies, compile DPVO manually.
-# Example:
-#   conda run -n wham bash -lc "cd /workspace/third-party/DPVO && ... && pip install ."
-
-ENV WHAM_PYTHON=/opt/conda/envs/wham/bin/python \
-    GMR_PYTHON=/opt/conda/envs/gmr/bin/python \
-    PYTHONPATH=/opt/src/wham
-
-WORKDIR /workspace
-CMD ["/bin/bash"]
+ENTRYPOINT ["/opt/src/wham/docker/entrypoint.sh"]

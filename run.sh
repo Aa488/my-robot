@@ -69,6 +69,11 @@ fi
 SMOOTH_ALPHA=${SMOOTH_ALPHA:-0.35}
 HEIGHT_ADJUST=${HEIGHT_ADJUST:-1}
 ROOT_ORIGIN_OFFSET=${ROOT_ORIGIN_OFFSET:-0}
+# Jump detection for height_adjust: the lowest foot must rise this far above a
+# running ground reference (a lower envelope of the foot height) before its
+# vertical motion is kept.  Relative to the envelope, not absolute ground.
+GMR_AIRBORNE_THRESHOLD=${GMR_AIRBORNE_THRESHOLD:-0.03}
+export GMR_AIRBORNE_THRESHOLD
 VIEWER_WARMUP_FRAMES=${VIEWER_WARMUP_FRAMES:-12}
 POLL_INTERVAL=${POLL_INTERVAL:-0.05}
 IDLE_TIMEOUT=${IDLE_TIMEOUT:-0}
@@ -88,7 +93,12 @@ WHAM_DEDICATED_STREAM=${WHAM_DEDICATED_STREAM:-1}
 # smoother trajectory, lower = lower latency. 0 via WHAM_LATEST_FRAME disables.
 WHAM_LATEST_FRAME=${WHAM_LATEST_FRAME:-1}
 WHAM_LATEST_FRAME_KEEP=${WHAM_LATEST_FRAME_KEEP:-3}
-export WHAM_USE_AMP WHAM_USE_MEDIAPIPE WHAM_USE_YOLOPOSE WHAM_MEDIAPIPE_COMPLEXITY WHAM_DETECT_INTERVAL WHAM_INFER_INTERVAL WHAM_STREAM_SEQ_LEN WHAM_INPUT_SCALE WHAM_DEDICATED_STREAM WHAM_PREVIEW WHAM_LATEST_FRAME WHAM_LATEST_FRAME_KEEP
+# Adaptive keep (webcam): widen the drop window to FAST_KEEP while root speed
+# exceeds SPEED_THRESHOLD m/s (fast motions like jumps), shrink back otherwise.
+WHAM_ADAPTIVE_KEEP=${WHAM_ADAPTIVE_KEEP:-1}
+WHAM_ADAPTIVE_FAST_KEEP=${WHAM_ADAPTIVE_FAST_KEEP:-8}
+WHAM_ADAPTIVE_SPEED_THRESHOLD=${WHAM_ADAPTIVE_SPEED_THRESHOLD:-1.5}
+export WHAM_USE_AMP WHAM_USE_MEDIAPIPE WHAM_USE_YOLOPOSE WHAM_MEDIAPIPE_COMPLEXITY WHAM_DETECT_INTERVAL WHAM_INFER_INTERVAL WHAM_STREAM_SEQ_LEN WHAM_INPUT_SCALE WHAM_DEDICATED_STREAM WHAM_PREVIEW WHAM_LATEST_FRAME WHAM_LATEST_FRAME_KEEP WHAM_ADAPTIVE_KEEP WHAM_ADAPTIVE_FAST_KEEP WHAM_ADAPTIVE_SPEED_THRESHOLD
 
 GMR_TORCH_DEVICE=${GMR_TORCH_DEVICE:-cpu}
 GMR_MAX_ITER=${GMR_MAX_ITER:-5}      # IK max iterations per stage (default reduced to 5 for real-time)
@@ -123,9 +133,9 @@ rm -f "${STREAM_NPZ_DIR}"/chunk_*.npz "${STREAM_NPZ_DIR}"/stream_done.flag "${GM
 
 echo "[E2E] Render flags: RECORD_WHAMVIDEO=${RECORD_WHAMVIDEO} RECORD_GMRVIDEO=${RECORD_GMRVIDEO} USE_XVFB_GMR=${USE_XVFB_GMR} WHAM_PREVIEW=${WHAM_PREVIEW:-<follow-record>} DISPLAY=${DISPLAY:-<unset>}"
 echo "[E2E] Camera params: follow=${CAMERA_FOLLOW} lookat_h=${CAMERA_LOOKAT_HEIGHT_OFFSET} elev=${CAMERA_ELEVATION} dist_scale=${CAMERA_DISTANCE_SCALE} azimuth=${CAMERA_AZIMUTH:-<auto>}"
-echo "[E2E] WHAM perf params: amp=${WHAM_USE_AMP} mediapipe=${WHAM_USE_MEDIAPIPE} yolopose=${WHAM_USE_YOLOPOSE} mp_complexity=${WHAM_MEDIAPIPE_COMPLEXITY} detect_interval=${WHAM_DETECT_INTERVAL} infer_interval=${WHAM_INFER_INTERVAL} seq_len=${WHAM_STREAM_SEQ_LEN} input_scale=${WHAM_INPUT_SCALE} dedicated_stream=${WHAM_DEDICATED_STREAM} latest_frame=${WHAM_LATEST_FRAME} latest_frame_keep=${WHAM_LATEST_FRAME_KEEP}"
+echo "[E2E] WHAM perf params: amp=${WHAM_USE_AMP} mediapipe=${WHAM_USE_MEDIAPIPE} yolopose=${WHAM_USE_YOLOPOSE} mp_complexity=${WHAM_MEDIAPIPE_COMPLEXITY} detect_interval=${WHAM_DETECT_INTERVAL} infer_interval=${WHAM_INFER_INTERVAL} seq_len=${WHAM_STREAM_SEQ_LEN} input_scale=${WHAM_INPUT_SCALE} dedicated_stream=${WHAM_DEDICATED_STREAM} latest_frame=${WHAM_LATEST_FRAME} latest_frame_keep=${WHAM_LATEST_FRAME_KEEP} adaptive_keep=${WHAM_ADAPTIVE_KEEP} adaptive_fast_keep=${WHAM_ADAPTIVE_FAST_KEEP} adaptive_speed_thresh=${WHAM_ADAPTIVE_SPEED_THRESHOLD}"
 echo "[E2E] WHAM stream mode=tail (fixed)"
-echo "[E2E] GMR torch_device=${GMR_TORCH_DEVICE}  max_iter=${GMR_MAX_ITER}"
+echo "[E2E] GMR torch_device=${GMR_TORCH_DEVICE}  max_iter=${GMR_MAX_ITER}  airborne_thresh=${GMR_AIRBORNE_THRESHOLD}"
 echo "[E2E] Source params: VIDEO=${VIDEO} TIME=${TIME} ROBOT=${ROBOT} ROBOTS=${ROBOTS} CSV_PATH=${CSV_PATH} CSV_ROOT=${CSV_ROOT}"
 echo "[E2E] GMR viewer mode: async thread + low-latency fixed profile (ready_timeout=${GMR_VIEWER_READY_TIMEOUT_SEC}s, join_timeout=${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC}s)"
 echo "[E2E] Warmup: enabled=${E2E_WARMUP} once=${E2E_WARMUP_ONCE} force=${E2E_WARMUP_FORCE}"

@@ -697,6 +697,24 @@ def run_stream_mt(
     # lower latency. Opt out entirely with WHAM_LATEST_FRAME=0.
     latest_frame_keep = max(1, int(os.environ.get("WHAM_LATEST_FRAME_KEEP", "3")))
 
+    # Adaptive backlog window (webcam only): fast motions like jumps have
+    # short-lived peaks (apex, max velocity) that a small fixed window tends to
+    # undersample. When the person's root moves faster than
+    # WHAM_ADAPTIVE_SPEED_THRESHOLD, widen the window to WHAM_ADAPTIVE_FAST_KEEP
+    # (accept a bit more latency to keep more frames); when slow, shrink back to
+    # `latest_frame_keep` for low latency. Opt out with WHAM_ADAPTIVE_KEEP=0.
+    adaptive_keep_enabled = (
+        is_webcam
+        and os.environ.get("WHAM_LATEST_FRAME", "1") != "0"
+        and env_flag("WHAM_ADAPTIVE_KEEP", True)
+    )
+    adaptive_fast_keep = max(latest_frame_keep, int(os.environ.get("WHAM_ADAPTIVE_FAST_KEEP", "8")))
+    adaptive_speed_thresh = float(os.environ.get("WHAM_ADAPTIVE_SPEED_THRESHOLD", "1.5"))
+    adaptive_max_step = float(os.environ.get("WHAM_ADAPTIVE_MAX_STEP", "0.5"))
+    # Current window, shared between the main loop (writer) and the detector/wham
+    # threads (readers). Initialized to the slow value.
+    adaptive_keep = [latest_frame_keep]
+
     def _cap_queue_backlog(q, keep, drop_counter):
         """Drop the oldest frames in `q` until at most `keep` (the newest) remain.
 
@@ -1096,7 +1114,7 @@ def run_stream_mt(
             # while keeping a few frames in FIFO order for a dense trajectory.
             # Disabled for file video; opt out with WHAM_LATEST_FRAME=0.
             if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
-                _cap_queue_backlog(read_Q, latest_frame_keep, upstream_drop_count)
+                _cap_queue_backlog(read_Q, adaptive_keep[0], upstream_drop_count)
 
             frame_id, start_time, frame = data
 
@@ -1257,7 +1275,7 @@ def run_stream_mt(
             # but at WHAM's input — if WHAM inference is the bottleneck relative
             # to the extractor, ext_Q backs up with stale frames.
             if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
-                _cap_queue_backlog(ext_Q, latest_frame_keep, upstream_drop_count)
+                _cap_queue_backlog(ext_Q, adaptive_keep[0], upstream_drop_count)
 
             frame_id, start_time, frame, track_id, kp2d, bbox_c, feature, init_data = data
 
@@ -2260,6 +2278,26 @@ def run_stream_mt(
                 # ourselves for a continuous pelvis position across windows.
                 curr_raw = sf["pelvis"][0].astype(np.float64)
 
+                # Adaptive backlog window: measure the person's root speed and
+                # widen/narrow the webcam drop window accordingly (config near
+                # `latest_frame_keep`). Uses the raw pelvis delta per frame,
+                # guarded against WHAM origin-reset jumps; fast motion (jumps,
+                # quick waves) widens the window to keep the peak frames.
+                if adaptive_keep_enabled:
+                    _prev_pos = gmr_state.get("prev_raw_pelvis_pos")
+                    _prev_ts = gmr_state.get("prev_speed_ts")
+                    if _prev_pos is not None and _prev_ts is not None:
+                        _dt = max(float(start_time) - float(_prev_ts), 1e-3)
+                        _disp = float(np.linalg.norm(curr_raw - _prev_pos))
+                        if _disp < adaptive_max_step:
+                            _ema = gmr_state.get("ema_speed", 0.0)
+                            _ema = 0.75 * _ema + 0.25 * (_disp / _dt)
+                            gmr_state["ema_speed"] = _ema
+                            adaptive_keep[0] = (
+                                adaptive_fast_keep if _ema >= adaptive_speed_thresh else latest_frame_keep
+                            )
+                    gmr_state["prev_speed_ts"] = float(start_time)
+
                 if gmr_state["global_pelvis_pos"] is None:
                     gmr_state["global_pelvis_pos"] = curr_raw.copy()
                     gmr_state["prev_raw_pelvis_pos"] = curr_raw.copy()
@@ -2321,6 +2359,17 @@ def run_stream_mt(
                         pelvis_quat /= np.linalg.norm(pelvis_quat)
                         sf["pelvis"] = (sf["pelvis"][0], pelvis_quat)
                 gmr_state["prev_pelvis_quat"] = pelvis_quat.copy()
+
+                if os.environ.get("WHAM_DEBUG_JUMP", "0") == "1":
+                    _la = float(sf["left_ankle"][0][2]) if "left_ankle" in sf else 0.0
+                    _ra = float(sf["right_ankle"][0][2]) if "right_ankle" in sf else 0.0
+                    _ma = min(_la, _ra)
+                    _pz = float(np.asarray(sf["pelvis"][0])[2])
+                    print(
+                        f"[JUMP-DBG] f={frame_id} pelvis_z={_pz:.3f} "
+                        f"min_ankle_z={_ma:.3f} pelvis_above_ankle={_pz - _ma:.3f}",
+                        flush=True,
+                    )
 
                 _t_adapt.append((time.perf_counter() - _t0_adapt) * 1000)
 
@@ -2436,7 +2485,7 @@ def run_stream_mt(
             e2e_p95 = float(np.percentile(e2e_vals, 95)) if len(e2e_vals) >= 20 else (float(np.max(e2e_vals)) if e2e_vals else 0.0)
             logger.info(
                 f"[Heartbeat] frame={frame_id} wham_fps={avg_fps:.2f} latency={latency:.2f}s "
-                f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)} main_drop={main_drop_count} front_drop={upstream_drop_count[0]} "
+                f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)} main_drop={main_drop_count} front_drop={upstream_drop_count[0]} keep={adaptive_keep[0]} speed={gmr_state.get('ema_speed', 0.0):.2f} "
                 f"adapt_ms={mean_adapt:.1f} ik_ms={mean_ik:.1f} post_ms={mean_post:.1f} wham_wait_ms={mean_wham_wait:.1f} "
                 f"e2e_avg_ms={e2e_avg:.1f} e2e_p95_ms={e2e_p95:.1f} "
                 f"gmr_preview_fps={gmr_preview_fps:.2f} {robot_rows}"

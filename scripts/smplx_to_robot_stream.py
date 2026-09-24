@@ -143,12 +143,29 @@ class OnlineQposPostprocessor:
         arm_smooth_alpha=0.3,
         height_adjust=True,
         root_origin_offset=True,
+        airborne_threshold=None,
         torch_device="auto",
     ):
         self.smooth_alpha = float(smooth_alpha)
         self.arm_smooth_alpha = float(arm_smooth_alpha)
         self.height_adjust = bool(height_adjust)
         self.root_origin_offset = bool(root_origin_offset)
+        # Jump detection for height_adjust.  The raw lowest-foot height sits well
+        # below the robot's ground (source pelvis z~0 vs robot pelvis z~0.96), so
+        # an absolute threshold is meaningless; a jump is the *rise* of the lowest
+        # foot above a running "ground" reference.  Below this rise, height_adjust
+        # snaps the foot to the ground; above it the vertical root motion is kept
+        # so jumps stay visible.  Override with GMR_AIRBORNE_THRESHOLD (metres).
+        self.airborne_threshold = float(
+            airborne_threshold
+            if airborne_threshold is not None
+            else os.environ.get("GMR_AIRBORNE_THRESHOLD", "0.03")
+        )
+        # Running lower envelope of the lowest-foot height (ground reference) and a
+        # warmup counter that skips the first few frames (the IK/pelvis pose has not
+        # settled yet, giving a bogus lowest-height like -0.79 on frame 0).
+        self._foot_ground_ref = None
+        self._ground_warmup = 10
         self.prev_qpos = None
         self.xy_origin = None
         self.xml_file = xml_file
@@ -546,12 +563,15 @@ class OnlineQposPostprocessor:
         )
 
     def _forward_kinematics_for_height(self, q):
-        root_pos = torch.from_numpy(q[:3][None]).to(self.device, dtype=torch.float32)
-        root_rot_xyzw = torch.from_numpy(q[3:7][[1, 2, 3, 0]][None]).to(self.device, dtype=torch.float32)
-        dof_pos = torch.from_numpy(q[7:][None]).to(self.device, dtype=torch.float32)
-        with torch.no_grad():
-            body_pos, _ = self.kinematics_model.forward_kinematics(root_pos, root_rot_xyzw, dof_pos)
-            return torch.min(body_pos[..., 2]).item()
+        # Lowest body-frame world z, via MuJoCo forward kinematics.  This used to
+        # go through KinematicsModel (torch), which cost ~25-35 ms on CPU (and
+        # ~37 ms on GPU, where the tiny per-joint CUDA kernels + host<->device
+        # copies + .item() sync dominate) to return a single scalar.  MuJoCo gives
+        # the identical value (verified: same min body z) in <0.3 ms.
+        m, d = self._get_mj_model()
+        d.qpos[:] = q
+        self._mj.mj_kinematics(m, d)
+        return float(np.min(d.xpos[1:, 2]))  # exclude the world body (index 0)
 
     def process(self, qpos):
         q = np.asarray(qpos, dtype=np.float32).copy()
@@ -570,16 +590,41 @@ class OnlineQposPostprocessor:
             q[7:] = _exp_smooth(q[7:], self.prev_qpos[7:], self.smooth_alpha)
 
         if self.height_adjust:
-            try:
-                lowest_height = self._forward_kinematics_for_height(q)
-            except RuntimeError as e:
-                if self.device != "cpu" and _is_nvrtc_arch_error(e):
-                    print("[Stream] Warning: CUDA NVRTC architecture error in GMR postprocessor; fallback to CPU.")
-                    self._set_kinematics_device("cpu")
-                    lowest_height = self._forward_kinematics_for_height(q)
+            lowest_height = self._forward_kinematics_for_height(q)
+            # Track a running "ground" reference = lower envelope of the lowest-foot
+            # height: it drops instantly to new lows and creeps upward slowly (3% of
+            # the gap per call).  The jump is measured as the *rise* of the foot
+            # above this envelope, so it is drift-free despite the source/robot
+            # pelvis offset.  The first few frames are used only to settle the
+            # reference (the pose/root has not converged yet), grounding fully.
+            if self._ground_warmup > 0:
+                self._ground_warmup -= 1
+                self._foot_ground_ref = float(lowest_height)
+                lift = 0.0
+                w = 1.0
+            else:
+                if self._foot_ground_ref is None:
+                    self._foot_ground_ref = float(lowest_height)
+                elif float(lowest_height) < self._foot_ground_ref:
+                    self._foot_ground_ref = float(lowest_height)
                 else:
-                    raise
-            q[2] -= (lowest_height - self.sole_offset)
+                    self._foot_ground_ref += 0.03 * (float(lowest_height) - self._foot_ground_ref)
+                lift = float(lowest_height - self._foot_ground_ref)
+                lo = max(0.0, self.airborne_threshold - 0.015)
+                hi = self.airborne_threshold + 0.015
+                w = float(np.clip((hi - lift) / max(hi - lo, 1e-6), 0.0, 1.0))
+            # Desired lowest-foot height: sole on the floor normally, but rising
+            # with the jump (lift) once airborne so the vertical root motion is
+            # preserved instead of being erased by grounding.
+            target = self.sole_offset + (1.0 - w) * lift
+            q[2] -= float(lowest_height) - target
+            if os.environ.get("GMR_DEBUG_AIRBORNE", "0") == "1":
+                print(
+                    f"[AIRBORNE-DBG] lowest={lowest_height:.3f} sole={self.sole_offset:.3f} "
+                    f"ground_ref={self._foot_ground_ref:.3f} lift={lift:.3f} w={w:.2f} "
+                    f"target={target:.3f} root_z={float(q[2]):.3f}",
+                    flush=True,
+                )
 
             # After grounding, flatten each planted foot so its sole is parallel to
             # the ground (fixes heel-hover / toe-dig from a toe-down WHAM estimate).

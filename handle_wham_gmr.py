@@ -474,6 +474,7 @@ def run_stream_mt(
     use_yolopose = env_flag('WHAM_USE_YOLOPOSE', False)
     detect_interval = max(1, int(os.environ.get('WHAM_DETECT_INTERVAL', '2')))
     infer_interval = max(1, int(os.environ.get('WHAM_INFER_INTERVAL', '1')))
+    batch_k = max(1, int(os.environ.get('WHAM_BATCH_K', '1')))
     stream_seq_len = max(4, int(os.environ.get('WHAM_STREAM_SEQ_LEN', str(STREAM_SEQ_LEN))))
     tcp_stream_wham = env_flag('TCP_STREAM_WHAM', True)
     tcp_stream_gmr = env_flag('TCP_STREAM_GMR', True)
@@ -508,7 +509,7 @@ def run_stream_mt(
     preview_max_h = max(240, int(os.environ.get('WHAM_PREVIEW_MAX_HEIGHT', '540')))
     logger.info(
         f"Perf opts: amp={int(use_amp)} detect_interval={detect_interval} "
-        f"infer_interval={infer_interval} seq_len={stream_seq_len} device={device} "
+        f"infer_interval={infer_interval} batch_k={batch_k} seq_len={stream_seq_len} device={device} "
         "stream_mode=tail"
     )
     heartbeat_frames = max(1, int(os.environ.get('PIPELINE_HEARTBEAT_FRAMES', '30')))
@@ -585,7 +586,31 @@ def run_stream_mt(
         cap = cv2.VideoCapture(0)
     else:
         cap = cv2.VideoCapture(video_path)
-    assert cap.isOpened(), f'Faild to load video file {video_path}'
+    if not cap.isOpened():
+        if is_webcam:
+            raise RuntimeError(
+                'Failed to open webcam camera 0: no camera device inside the '
+                'container. Mount one with `--device /dev/video0`, or pass a '
+                'video file path instead of 0.'
+            )
+        raise RuntimeError(f'Failed to load video file: {video_path}')
+
+    if is_webcam:
+        # usbipd-passthrough UVC cameras often stall on the default YUYV format
+        # (0 frames -> OpenCV select() timeout), while MJPEG streams reliably.
+        # Force MJPEG at a supported 640x480 resolution before the first read.
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            logger.info(
+                f"[Input] webcam negotiated MJPEG@640x480 "
+                f"(fourcc=0x{int(cap.get(cv2.CAP_PROP_FOURCC)):08x}, "
+                f"size={int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))})"
+            )
+        except Exception as exc:
+            logger.warning(f"[Input] webcam: failed to force MJPEG ({exc}); using camera defaults")
+
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
@@ -1256,6 +1281,96 @@ def run_stream_mt(
         init_root = pt_transforms.matrix_to_rotation_6d(init_output.global_orient).to(device)
         return (init_kp, init_smpl), init_root
 
+    _FLAT_PRED_KEYS = ('verts_cam', 'trans_cam', 'poses_body', 'poses_root_cam')
+
+    def _slice_pred_single(pred, j, K, F):
+        """把 batch=K 的 forward 输出按窗口 j 切成 batch=1 的 dict，供既有 extract_latest_* 复用。"""
+        out = {}
+        for k, v in pred.items():
+            if not torch.is_tensor(v):
+                out[k] = v
+                continue
+            if k in _FLAT_PRED_KEYS:
+                out[k] = v[j * F:(j + 1) * F]      # [K*F, ...] 拍平键
+            else:
+                out[k] = v[j:j + 1]                 # [K, F, ...] 批键，保留 batch 维
+        return out
+
+    def _infer_batch(hist, track_id):
+        K = batch_k
+        F = stream_seq_len
+        L = len(hist['kp2d'])
+        kp_list = list(hist['kp2d'])
+        bb_list = list(hist['bbox'])
+        ft_list = list(hist['feature'])
+        pending = hist['pending'][-K:]
+        kp2d_all = torch.from_numpy(np.stack(kp_list, axis=0)).float()      # [L,17,3]
+        bbox_all = torch.from_numpy(np.stack(bb_list, axis=0)).float()      # [L,3]
+        norm_all, _ = keypoints_normalizer(
+            kp2d_all[..., :-1].clone(), res, intrinsics, 224, 224, bbox_all)  # [L,37]
+        xs, masks, feats, bboxes = [], [], [], []
+        for j in range(K):
+            s = L - F - j
+            e = L - j
+            xs.append(norm_all[s:e])                       # [F,37]
+            masks.append((kp2d_all[s:e, :, -1] < 0.3))     # [F,17]
+            feats.append(torch.stack(ft_list[s:e], dim=0))  # [F,1024]
+            bboxes.append(bbox_all[s:e])                   # [F,3]
+        x = torch.stack(xs, dim=0).to(device, non_blocking=True)        # [K,F,37]
+        mask = torch.stack(masks, dim=0).to(device, non_blocking=True)  # [K,F,17]
+        feature = torch.stack(feats, dim=0).to(device, non_blocking=True)  # [K,F,1024]
+        bbox = torch.stack(bboxes, dim=0).to(device, non_blocking=True)  # [K,F,3]
+
+        if hist['cached_inits'] is None or hist['cached_init_root'] is None:
+            hist['cached_inits'], hist['cached_init_root'] = build_wham_inits(
+                hist['init_data'], norm_all[0].clone().to(device))
+        init_kp, init_smpl = hist['cached_inits']
+        init_root = hist['cached_init_root']
+        inits = (init_kp.repeat(K, 1, 1), init_smpl.repeat(K, 1, 1, 1))
+        init_root_b = init_root.repeat(K, 1, 1)
+        cam_angvel = torch.zeros((K, F, 6), device=device)
+
+        try:
+            stream_ctx = torch.cuda.stream(wham_stream) if wham_stream is not None else nullcontext()
+            with stream_ctx:
+                if wham_stream is not None:
+                    wham_stream.wait_stream(torch.cuda.default_stream())
+                _t0 = time.perf_counter()
+                with torch.inference_mode():
+                    with autocast_ctx():
+                        pred = network(
+                            x, inits, feature,
+                            mask=mask, init_root=init_root_b, cam_angvel=cam_angvel,
+                            return_y_up=True,
+                            cam_intrinsics=intrinsics_batch.repeat(K, 1, 1, 1),
+                            bbox=bbox, res=res_batch.repeat(K, 1),
+                            refine_traj=False, states=None)
+                _t_ms = (time.perf_counter() - _t0) * 1000
+                if pending[0][0] % 10 == 0:
+                    logger.info(f"[WHAM] infer_ms={_t_ms:.1f}  batch={K}  frames={pending[0][0]}-{pending[-1][0]}")
+                for p in range(K):          # 按帧序 oldest -> newest 回放
+                    j = K - 1 - p
+                    single = _slice_pred_single(pred, j, K, F)
+                    verts_cam = extract_latest_vertices(single).detach().cpu().numpy()
+                    smplx_params = extract_latest_smplx_params(single)
+                    fid, st, fr = pending[p]
+                    hist['last_pred'] = (verts_cam.copy(), {kk: vv.copy() for kk, vv in smplx_params.items()})
+                    while not stop_event.is_set():
+                        try:
+                            wham_Q.put((fid, st, fr, True, verts_cam, track_id, smplx_params), timeout=0.1)
+                            break
+                        except Full:
+                            continue
+        except Exception:
+            logger.exception(f"WHAM batched inference failed (frames {pending[0][0]}-{pending[-1][0]})")
+            for (fid, st, fr) in pending:
+                while not stop_event.is_set():
+                    try:
+                        wham_Q.put((fid, st, fr, False, None, track_id, None), timeout=0.1)
+                        break
+                    except Full:
+                        continue
+
     def wham_thread():
         temporal_history = {}
 
@@ -1282,16 +1397,31 @@ def run_stream_mt(
             if track_id is not None:
                 if track_id not in temporal_history:
                     temporal_history[track_id] = {
-                        'kp2d': deque(maxlen=stream_seq_len),
-                        'bbox': deque(maxlen=stream_seq_len),
-                        'feature': deque(maxlen=stream_seq_len),
+                        'kp2d': deque(maxlen=stream_seq_len + batch_k - 1),
+                        'bbox': deque(maxlen=stream_seq_len + batch_k - 1),
+                        'feature': deque(maxlen=stream_seq_len + batch_k - 1),
                         'init_data': init_data,
                         'cached_inits': None,
                         'cached_init_root': None,
                         'last_pred': None,
+                        'pending': [],
+                        'since': 0,
                     }
 
                 hist = temporal_history[track_id]
+
+                if batch_k > 1:
+                    hist['kp2d'].append(kp2d)
+                    hist['bbox'].append(bbox_c)
+                    hist['feature'].append(feature.squeeze(0).detach())
+                    hist['pending'].append((frame_id, start_time, frame))
+                    hist['since'] += 1
+                    if hist['since'] >= batch_k and len(hist['kp2d']) >= stream_seq_len + batch_k - 1:
+                        _infer_batch(hist, track_id)
+                        hist['pending'] = []
+                        hist['since'] = 0
+                    continue
+
                 hist['kp2d'].append(kp2d)
                 hist['bbox'].append(bbox_c)
                 hist['feature'].append(feature.squeeze(0).detach())
@@ -2207,6 +2337,12 @@ def run_stream_mt(
     # Stale WHAM frames skipped by the latest-frame drain (real-time only).
     main_drop_count = 0
 
+    # Per-second throughput: count frames that pass through the main loop each
+    # wall-clock second (a direct "frames in last 1s" counter, separate from the
+    # rolling-interval avg_fps used elsewhere).
+    fps_win_start = time.time()
+    fps_win_count = 0
+
     while True:
         try:
             _t0_q = time.perf_counter()
@@ -2456,6 +2592,18 @@ def run_stream_mt(
         last_frame_time = curr_time
         frame_times.append(throughput_time)
         avg_fps = 1.0 / (sum(frame_times) / len(frame_times))
+
+        # Per-second throughput print: how many frames went through the main
+        # loop in the last wall-clock second.
+        fps_win_count += 1
+        if curr_time - fps_win_start >= 1.0:
+            win_secs = curr_time - fps_win_start
+            logger.info(
+                f"[FPS] {fps_win_count} frames in last {win_secs:.2f}s = "
+                f"{fps_win_count / win_secs:.1f} fps"
+            )
+            fps_win_start = curr_time
+            fps_win_count = 0
         
         # Calculate latency
         latency = curr_time - start_time

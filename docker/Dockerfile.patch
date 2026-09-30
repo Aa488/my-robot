@@ -1,0 +1,15 @@
+# Patch image: bake the recent source-only improvements on top of the existing
+# full image (wham-gmr:latest) without rebuilding deps/weights. Only the changed
+# runtime files are re-COPY'd, so the build is seconds and adds a tiny layer.
+#
+# Build:  docker build -f docker/Dockerfile.patch -t wham-gmr:latest .
+FROM wham-gmr:latest
+
+WORKDIR /opt/src/wham
+
+COPY handle_wham_gmr.py /opt/src/wham/handle_wham_gmr.py
+COPY run.sh /opt/src/wham/run.sh
+COPY docker/entrypoint.sh /opt/src/wham/docker/entrypoint.sh
+
+# Windows checkout strips the exec bit; the exec-form ENTRYPOINT needs it back.
+RUN chmod +x /opt/src/wham/docker/entrypoint.sh /opt/src/wham/run.sh

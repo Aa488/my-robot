@@ -44,6 +44,9 @@ checkpoints/dpvo.pth
 checkpoints/vitpose-h-multi-coco.pth
 checkpoints/yolov8x.pt
 checkpoints/yolov8s-pose.pt
+# WHAM non-bedlam checkpoint (503M) — demo.yaml loads the bedlam variant; this one
+# is only used by offline lib.eval.* benchmarks, never by the streaming pipeline.
+checkpoints/wham_vit_w_3dpw.pth.tar
 
 # SMPL-X -> SMPL conversion matrix (578M) — evaluation only, not the live pipeline
 dataset/body_models/smplx2smpl.pkl
@@ -52,3 +55,29 @@ dataset/body_models/smpl/__MACOSX/
 
 # large demo gif tracked via LFS
 docs/video/
+
+# ---- robot assets: bake only the competition targets ------------------------
+# Keep assets/unitree_g1 (default) + assets/linglong2 + assets/body_models
+# (SMPL-X) + the small PNGs. All other robots are excluded (~1.15G saved).
+assets/stanford_toddy
+assets/pnd_adam_lite
+assets/unitree_h1
+assets/unitree_h1_2
+assets/galaxea_r1pro
+assets/engineai_pm01
+assets/Lite_11_v1
+assets/fourier_n1
+assets/fourier_gr3v2_1_1
+assets/berkeley_humanoid_lite
+assets/agibot_a2
+assets/openloong
+assets/kuavo_s45
+assets/booster_k1
+assets/booster_t1_29dof
+assets/booster_t1
+assets/x02lite
+assets/hightorque_hi
+assets/pal_talos
+assets/tienkung
+assets/xsens_bvh_test
+assets/hard_motions

@@ -17,18 +17,21 @@ export PYTHONPATH=/opt/src/wham
 export WHAM_ENV=wham_gmr
 export GMR_ENV=wham_gmr
 
-# Input video: positional argument, else the baked-in demo clip.
-export VIDEO="${1:-/opt/src/wham/examples/drone_video.mp4}"
+# Input video: positional argument wins, then -e VIDEO, then the baked-in demo clip.
+export VIDEO="${1:-${VIDEO:-/opt/src/wham/examples/drone_video.mp4}}"
 
 # Target robot (override with -e ROBOT=...).
 export ROBOT="${ROBOT:-unitree_g1}"
 
-# Headless recording: xvfb + MuJoCo EGL offscreen renderer (no physical display).
+# Headless recording by default: xvfb + MuJoCo EGL offscreen renderer (no physical
+# display). To pop a live viewer window, override with
+#   -e USE_XVFB_GMR=0 -e MUJOCO_GL=glfw -e DISPLAY=<x-server>:0
+# (DISPLAY must point at a reachable X server, e.g. VcXsrv on the Windows host).
 # Robot-side rendering only; skip the WHAM mesh-overlay video (needs pytorch3d).
-export RECORD_GMRVIDEO=1
+export RECORD_GMRVIDEO="${RECORD_GMRVIDEO:-1}"
 export RECORD_WHAMVIDEO="${RECORD_WHAMVIDEO:-0}"
-export USE_XVFB_GMR=1
-export MUJOCO_GL=egl
+export USE_XVFB_GMR="${USE_XVFB_GMR:-1}"
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 # Performance defaults (override with -e): fp16 WHAM on GPU, GMR IK on CPU.
 export WHAM_USE_AMP="${WHAM_USE_AMP:-1}"

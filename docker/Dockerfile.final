@@ -1,0 +1,37 @@
+# Final image = full runtime env (wham-gmr:depsonly) + project source/weights.
+# Built FROM the deps-only image so the heavy install layers are reused as-is and
+# no build cache is needed — the final image only adds the COPY layers (~4GB) on
+# top of deps-only's 11.8GB. Build:
+#   docker build -f docker/Dockerfile.final -t wham-gmr:latest .
+FROM wham-gmr:depsonly
+
+ENV PYTHONPATH=/opt/src/wham \
+    WHAM_ENV=wham_gmr \
+    GMR_ENV=wham_gmr
+
+# Weights split across multiple COPY layers (not one `COPY .`): a single ~4GB
+# layer OOMs buildkitd during export (`exporting layers` dies with
+# `error reading from server: EOF`). Each layer is kept <= ~2.6GB — the same
+# size as the torch RUN layer, which compresses clean.
+WORKDIR /opt/src/wham
+COPY checkpoints/hmr2a.ckpt /opt/src/wham/checkpoints/
+COPY checkpoints/wham_vit_bedlam_w_3dpw.pth.tar \
+     checkpoints/vitpose_base_coco_aic_mpii.pth \
+     checkpoints/yolov8n.pt \
+     checkpoints/yolov8n-pose.pt /opt/src/wham/checkpoints/
+COPY assets /opt/src/wham/assets
+COPY dataset /opt/src/wham/dataset
+COPY docs /opt/src/wham/docs
+COPY examples /opt/src/wham/examples
+COPY third-party /opt/src/wham/third-party
+COPY lib /opt/src/wham/lib
+COPY configs /opt/src/wham/configs
+COPY scripts /opt/src/wham/scripts
+COPY docker /opt/src/wham/docker
+COPY general_motion_retargeting /opt/src/wham/general_motion_retargeting
+COPY *.py *.txt *.sh *.ps1 LICENSE README.md TECHNICAL_REPORT.md /opt/src/wham/
+
+# Files checked out on Windows have no exec bit; ENTRYPOINT exec-form needs it.
+RUN chmod +x /opt/src/wham/docker/entrypoint.sh
+
+ENTRYPOINT ["/opt/src/wham/docker/entrypoint.sh"]

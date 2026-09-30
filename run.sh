@@ -20,8 +20,20 @@ export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 WHAM_ENV=${WHAM_ENV:-wham_gmr}
 GMR_ENV=${GMR_ENV:-wham_gmr}
+E2E_VALIDATE_ENV_ONLY=${E2E_VALIDATE_ENV_ONLY:-0}
 WHAM_PYTHON=${WHAM_PYTHON:-$(which python)}
 GMR_PYTHON=${GMR_PYTHON:-$(which python)}
+
+# Validate that the selected WHAM Python can import smplx before starting the
+# pipeline (mirrors run.ps1); optional env-only validation shortcut.
+if ! "${WHAM_PYTHON}" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('smplx') else 1)" >/dev/null 2>&1; then
+	echo "[E2E] Selected WHAM_PYTHON cannot import 'smplx': ${WHAM_PYTHON}" >&2
+	exit 1
+fi
+if [[ "${E2E_VALIDATE_ENV_ONLY}" == "1" ]]; then
+	echo "[E2E] Environment validation only; exiting before pipeline start."
+	exit 0
+fi
 
 VIDEO=${VIDEO:-examples/IMG_9732.mov}
 TIME=${TIME:-0}
@@ -115,11 +127,13 @@ E2E_WARMUP_CACHE_ROOT=${E2E_WARMUP_CACHE_ROOT:-${PWD}/.cache/wham-gmr}
 
 # GMR viewer camera controls.
 CAMERA_FOLLOW=${CAMERA_FOLLOW:-0}
+TRACK=${TRACK:-0}
 # Default to a lower, slightly top-down and closer camera framing.
 CAMERA_LOOKAT_HEIGHT_OFFSET=${CAMERA_LOOKAT_HEIGHT_OFFSET:-0.45}
 CAMERA_ELEVATION=${CAMERA_ELEVATION:--28.0}
 CAMERA_DISTANCE_SCALE=${CAMERA_DISTANCE_SCALE:-1.70}
 CAMERA_AZIMUTH=${CAMERA_AZIMUTH:-}
+TCP=${TCP:-0}
 
 mkdir -p "${OUTPUT_DIR}" "$(dirname "${PKL_PATH}")" "${CSV_ROOT}" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
 
@@ -241,6 +255,18 @@ if [[ "${CAMERA_FOLLOW}" == "1" ]]; then
 	INTEGRATED_CMD+=(--camera_follow)
 else
 	INTEGRATED_CMD+=(--no-camera_follow)
+fi
+
+if [[ "${TRACK}" == "1" ]]; then
+	INTEGRATED_CMD+=(--track)
+else
+	INTEGRATED_CMD+=(--no-track)
+fi
+
+if [[ "${TCP}" == "1" ]]; then
+	INTEGRATED_CMD+=(--tcp)
+else
+	INTEGRATED_CMD+=(--no-tcp)
 fi
 
 if [[ -n "${CAMERA_AZIMUTH}" ]]; then

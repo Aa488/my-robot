@@ -10,6 +10,7 @@ WORKDIR /opt/src/wham
 COPY handle_wham_gmr.py /opt/src/wham/handle_wham_gmr.py
 COPY run.sh /opt/src/wham/run.sh
 COPY docker/entrypoint.sh /opt/src/wham/docker/entrypoint.sh
+COPY lib/models/preproc/detector.py /opt/src/wham/lib/models/preproc/detector.py
 COPY assets/linglong2/linglong2.xml /opt/src/wham/assets/linglong2/linglong2.xml
 COPY general_motion_retargeting/robot_motion_viewer.py /opt/src/wham/general_motion_retargeting/robot_motion_viewer.py
 

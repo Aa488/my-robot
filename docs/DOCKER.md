@@ -58,7 +58,7 @@ docker run --gpus all --rm -v $PWD/out:/output \
 | `/output/pkl/my_motion.pkl` | 重定向后的人体/机器人运动 |
 | `/output/video/live_stream_robot.mp4` | 渲染出的机器人动画 |
 
-**入口参数**：位置参数 = 输入视频路径（默认内置 `examples/drone_video.mp4`）。可用 `-e` 覆盖：`ROBOT`（默认 `unitree_g1`）、`WHAM_USE_AMP`、`GMR_TORCH_DEVICE`、`WHAM_USE_MEDIAPIPE`、`WHAM_USE_YOLOPOSE`、`WHAM_DETECT_INTERVAL` 等（同 `run.sh`）。
+**入口参数**：位置参数 = 输入视频路径（默认内置 `examples/drone_video.mp4`）。可用 `-e` 覆盖：`ROBOT`（默认 `linglong2`）、`WHAM_USE_AMP`、`GMR_TORCH_DEVICE`、`WHAM_USE_MEDIAPIPE`、`WHAM_USE_YOLOPOSE`、`WHAM_DETECT_INTERVAL`、`WHAM_BBOX_DEVICE`、`GMR_HEADLESS_RECORD` 等（同 `run.sh`）。
 
 ## 导出 / 加载 tar
 

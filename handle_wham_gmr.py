@@ -1873,10 +1873,15 @@ def run_stream_mt(
 
             # Headless offscreen path (no GLFW window). Recording via the GLFW
             # RobotMotionViewer renders TWICE per frame (window + offscreen mp4),
-            # which doubles GPU load and latency; record headlessly unless the live
-            # window is explicitly requested (GMR_HEADLESS_RECORD=0).
-            _headless_record = gmr_args.record_gmrvideo and env_flag('GMR_HEADLESS_RECORD', True)
-            if _is_headless and (not gmr_args.record_gmrvideo or _headless_record):
+            # which doubles GPU load and latency. GMR_HEADLESS_RECORD=1 (default)
+            # records headlessly regardless of DISPLAY (Windows, Docker/xvfb, etc.);
+            # GMR_HEADLESS_RECORD=0 keeps the live window. Non-recording
+            # (TCP/capture) still falls back to headless only when no display.
+            _use_headless = (
+                (gmr_args.record_gmrvideo and env_flag('GMR_HEADLESS_RECORD', True))
+                or (_is_headless and not gmr_args.record_gmrvideo)
+            )
+            if _use_headless:
                 try:
                     gmr_state["viewer"] = _HeadlessViewer(**v_kws)
                     logger.info(f"Initialized headless GMR viewer for {gmr_args.robot}")
@@ -1989,9 +1994,13 @@ def run_stream_mt(
             v_kws["robot_path"] = gmr_args.robot_path
 
         _is_headless = not os.environ.get("DISPLAY")
-        _headless_record = (gmr_args.record_gmrvideo and state["index"] == 0) and env_flag('GMR_HEADLESS_RECORD', True)
+        _record_this = gmr_args.record_gmrvideo and state["index"] == 0
+        _use_headless = (
+            (_record_this and env_flag('GMR_HEADLESS_RECORD', True))
+            or (_is_headless and not _record_this)
+        )
         try:
-            if _is_headless and (not (gmr_args.record_gmrvideo and state["index"] == 0) or _headless_record):
+            if _use_headless:
                 state["viewer"] = _HeadlessViewer(**v_kws)
                 logger.info(f"Initialized headless GMR viewer for {robot_key}")
             else:

@@ -151,7 +151,7 @@ $GMR_PYTHON   = _env GMR_PYTHON   $WHAM_PYTHON
 
 $VIDEO        = _env VIDEO        "examples/IMG_9732.mov"
 $TIME         = _env TIME         "0"
-$ROBOT        = _env ROBOT        "unitree_g1"
+$ROBOT        = _env ROBOT        "linglong2"
 $ROBOTS       = _env ROBOTS       $ROBOT
 $ROBOT_PATH   = _env ROBOT_PATH   ""
 
@@ -166,7 +166,7 @@ if ($ROBOT_PATH) {
 }
 
 # Backward compatibility.
-$LEGACY_RECORD_VIDEO  = _env RECORD_VIDEO   "0"
+$LEGACY_RECORD_VIDEO  = _env RECORD_VIDEO   "1"
 $RECORD_WHAMVIDEO     = _env RECORD_WHAMVIDEO $LEGACY_RECORD_VIDEO
 $RECORD_GMRVIDEO      = _env RECORD_GMRVIDEO  $LEGACY_RECORD_VIDEO
 $USE_XVFB_GMR         = _env USE_XVFB_GMR     "0"
@@ -202,11 +202,12 @@ $IDLE_TIMEOUT          = _env IDLE_TIMEOUT          "0"
 $DONE_GRACE_SEC        = _env DONE_GRACE_SEC        "2.0"
 
 # WHAM performance controls.
-$WHAM_USE_AMP          = _env WHAM_USE_AMP          "0"
+$WHAM_USE_AMP          = _env WHAM_USE_AMP          "1"
 $WHAM_USE_MEDIAPIPE    = _env WHAM_USE_MEDIAPIPE    "0"
 $WHAM_USE_YOLOPOSE     = _env WHAM_USE_YOLOPOSE     "0"
 $WHAM_MEDIAPIPE_COMPLEXITY = _env WHAM_MEDIAPIPE_COMPLEXITY "0"
 $WHAM_DETECT_INTERVAL  = _env WHAM_DETECT_INTERVAL  "1"
+$WHAM_BBOX_DEVICE      = _env WHAM_BBOX_DEVICE      "cpu"
 $WHAM_INFER_INTERVAL   = _env WHAM_INFER_INTERVAL   "1"
 $WHAM_STREAM_SEQ_LEN   = _env WHAM_STREAM_SEQ_LEN   "16"
 $WHAM_INPUT_SCALE      = _env WHAM_INPUT_SCALE      "1.0"
@@ -225,6 +226,7 @@ $env:WHAM_USE_MEDIAPIPE   = $WHAM_USE_MEDIAPIPE
 $env:WHAM_USE_YOLOPOSE    = $WHAM_USE_YOLOPOSE
 $env:WHAM_MEDIAPIPE_COMPLEXITY = $WHAM_MEDIAPIPE_COMPLEXITY
 $env:WHAM_DETECT_INTERVAL = $WHAM_DETECT_INTERVAL
+$env:WHAM_BBOX_DEVICE   = $WHAM_BBOX_DEVICE
 $env:WHAM_INFER_INTERVAL  = $WHAM_INFER_INTERVAL
 $env:WHAM_STREAM_SEQ_LEN  = $WHAM_STREAM_SEQ_LEN
 $env:WHAM_INPUT_SCALE     = $WHAM_INPUT_SCALE
@@ -237,7 +239,7 @@ $env:WHAM_ADAPTIVE_FAST_KEEP = $WHAM_ADAPTIVE_FAST_KEEP
 $env:WHAM_ADAPTIVE_SPEED_THRESHOLD = $WHAM_ADAPTIVE_SPEED_THRESHOLD
 $env:GMR_AIRBORNE_THRESHOLD = $GMR_AIRBORNE_THRESHOLD
 
-$GMR_TORCH_DEVICE                     = _env GMR_TORCH_DEVICE                     "cpu"
+$GMR_TORCH_DEVICE                     = _env GMR_TORCH_DEVICE                     "cuda"
 $GMR_VIEWER_READY_TIMEOUT_SEC         = _env GMR_VIEWER_READY_TIMEOUT_SEC         "8"
 $GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC   = _env GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC   "10"
 
@@ -252,9 +254,21 @@ $CAMERA_FOLLOW               = _env CAMERA_FOLLOW               "1"
 $TRACK                       = _env TRACK                       "0"
 $CAMERA_LOOKAT_HEIGHT_OFFSET = _env CAMERA_LOOKAT_HEIGHT_OFFSET "0.50"
 $CAMERA_ELEVATION            = _env CAMERA_ELEVATION            "0"
-$CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.70"
+$CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.5"
 $CAMERA_AZIMUTH              = _env CAMERA_AZIMUTH              "90"
 $TCP                         = _env TCP                         "0"
+
+# GMR robot video recording: 1 = headless offscreen (no GLFW window; renders only
+# the mp4 frame, ~half the GPU load vs the live window), 0 = live window + recording.
+# Headless recording writes the same robot mp4 — it just skips the on-screen render.
+$GMR_HEADLESS_RECORD = _env GMR_HEADLESS_RECORD "1"
+$env:GMR_HEADLESS_RECORD = $GMR_HEADLESS_RECORD
+# Offscreen render resolution cap (headless recording renders at this size; lower
+# it to cut GPU render cost further, e.g. 480x270 = ~4x cheaper than 960x540).
+$GMR_VIEWER_MAX_WIDTH  = _env GMR_VIEWER_MAX_WIDTH  "960"
+$GMR_VIEWER_MAX_HEIGHT = _env GMR_VIEWER_MAX_HEIGHT "540"
+$env:GMR_VIEWER_MAX_WIDTH  = $GMR_VIEWER_MAX_WIDTH
+$env:GMR_VIEWER_MAX_HEIGHT = $GMR_VIEWER_MAX_HEIGHT
 
 Write-Host "[E2E] Python selection: WHAM_ENV=$WHAM_ENV GMR_ENV=$GMR_ENV CONDA_PREFIX=$(if ($env:CONDA_PREFIX) { $env:CONDA_PREFIX } else { '<unset>' }) WHAM_PYTHON=$WHAM_PYTHON GMR_PYTHON=$GMR_PYTHON"
 if (-not (Test-PythonModuleAvailable $WHAM_PYTHON "smplx")) {
@@ -290,9 +304,9 @@ Remove-Item -Force -ErrorAction SilentlyContinue $GMR_READY_FLAG
 Remove-Item -Force -ErrorAction SilentlyContinue $STREAM_TAIL_PATH
 
 $_display = if ($env:DISPLAY) { $env:DISPLAY } else { '<unset>' }
-Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO TCP=$TCP USE_XVFB_GMR=$USE_XVFB_GMR WHAM_PREVIEW=$(if ($WHAM_PREVIEW) { $WHAM_PREVIEW } else { '<follow-record>' }) DISPLAY=$_display"
+Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO GMR_HEADLESS_RECORD=$GMR_HEADLESS_RECORD vid_res=${GMR_VIEWER_MAX_WIDTH}x${GMR_VIEWER_MAX_HEIGHT} TCP=$TCP USE_XVFB_GMR=$USE_XVFB_GMR WHAM_PREVIEW=$(if ($WHAM_PREVIEW) { $WHAM_PREVIEW } else { '<follow-record>' }) DISPLAY=$_display"
 Write-Host "[E2E] Camera params: follow=$CAMERA_FOLLOW track=$TRACK lookat_h=$CAMERA_LOOKAT_HEIGHT_OFFSET elev=$CAMERA_ELEVATION dist_scale=$CAMERA_DISTANCE_SCALE azimuth=$(if ($CAMERA_AZIMUTH) { $CAMERA_AZIMUTH } else { '<auto>' })"
-Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP mediapipe=$WHAM_USE_MEDIAPIPE yolopose=$WHAM_USE_YOLOPOSE mp_complexity=$WHAM_MEDIAPIPE_COMPLEXITY detect_interval=$WHAM_DETECT_INTERVAL infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE dedicated_stream=$WHAM_DEDICATED_STREAM latest_frame=$WHAM_LATEST_FRAME latest_frame_keep=$WHAM_LATEST_FRAME_KEEP adaptive_keep=$WHAM_ADAPTIVE_KEEP adaptive_fast_keep=$WHAM_ADAPTIVE_FAST_KEEP adaptive_speed_thresh=$WHAM_ADAPTIVE_SPEED_THRESHOLD"
+Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP mediapipe=$WHAM_USE_MEDIAPIPE yolopose=$WHAM_USE_YOLOPOSE mp_complexity=$WHAM_MEDIAPIPE_COMPLEXITY detect_interval=$WHAM_DETECT_INTERVAL bbox_device=$WHAM_BBOX_DEVICE infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE dedicated_stream=$WHAM_DEDICATED_STREAM latest_frame=$WHAM_LATEST_FRAME latest_frame_keep=$WHAM_LATEST_FRAME_KEEP adaptive_keep=$WHAM_ADAPTIVE_KEEP adaptive_fast_keep=$WHAM_ADAPTIVE_FAST_KEEP adaptive_speed_thresh=$WHAM_ADAPTIVE_SPEED_THRESHOLD"
 Write-Host "[E2E] WHAM stream mode=tail (fixed)"
 Write-Host "[E2E] GMR torch_device=$GMR_TORCH_DEVICE"
 Write-Host "[E2E] Source params: VIDEO=$VIDEO TIME=$TIME ROBOT=$ROBOT ROBOTS=$ROBOTS OUTPUT_ROOT=$(if ($OUTPUT_ROOT) { $OUTPUT_ROOT } else { '<default>' }) CSV_PATH=$CSV_PATH CSV_ROOT=$CSV_ROOT TCP=$TCP"
@@ -304,7 +318,11 @@ if ($RECORD_GMRVIDEO -eq "1" -and $USE_XVFB_GMR -eq "1") {
     Write-Warning "[E2E] xvfb-run is not available on Windows. Falling back to direct rendering."
 }
 if ($RECORD_GMRVIDEO -eq "1" -and -not $env:DISPLAY) {
-    Write-Host "[E2E] Warning: DISPLAY is empty; MuJoCo window may not appear."
+    if ($GMR_HEADLESS_RECORD -eq "1") {
+        Write-Host "[E2E] GMR recording in headless offscreen mode (no window needed)."
+    } else {
+        Write-Host "[E2E] Warning: DISPLAY is empty; MuJoCo window may not appear."
+    }
 }
 
 # ---- warmup helpers ----

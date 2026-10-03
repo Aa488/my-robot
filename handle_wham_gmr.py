@@ -362,7 +362,8 @@ class _HeadlessViewer:
     def __init__(self, robot_type, camera_follow=True, motion_fps=30,
                  camera_lookat_height_offset=0.50, camera_elevation=0.0,
                  camera_distance_scale=1.70, camera_azimuth=None,
-                 robot_path=None, **_kwargs):
+                 robot_path=None, record_video=False, video_path=None,
+                 video_width=640, video_height=480, **_kwargs):
         from general_motion_retargeting.params import ROBOT_XML_DICT, ROBOT_BASE_DICT, VIEWER_CAM_DISTANCE_DICT
 
         xml_path = robot_path if robot_path and str(robot_path).strip() else ROBOT_XML_DICT[robot_type]
@@ -386,6 +387,16 @@ class _HeadlessViewer:
         self._cam.azimuth = float(self.camera_azimuth) if self.camera_azimuth is not None else 90.0
 
         self.viewer = type('_CamHolder', (), {'cam': self._cam})()
+
+        # Offscreen video recording without a GLFW window: only the mp4 render is
+        # done, so recording does not pay a redundant on-screen window render too.
+        self.record_video = record_video
+        self.renderer = None
+        self.mp4_writer = None
+        if record_video:
+            import imageio
+            self.mp4_writer = imageio.get_writer(video_path, fps=motion_fps)
+            self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
 
     def _camera_lookat_from_robot_bounds(self):
         positions = np.asarray(self.data.xpos[1:], dtype=np.float64)
@@ -424,8 +435,13 @@ class _HeadlessViewer:
         if follow_camera:
             self._update_follow_camera()
 
+        if self.record_video:
+            self.renderer.update_scene(self.data, camera=self._cam)
+            self.mp4_writer.append_data(self.renderer.render())
+
     def close(self):
-        pass
+        if self.record_video and self.mp4_writer is not None:
+            self.mp4_writer.close()
 
 
 STREAM_SEQ_LEN = 16
@@ -472,6 +488,13 @@ def run_stream_mt(
     use_amp = env_flag('WHAM_USE_AMP', True) and is_cuda_device
     use_mediapipe = env_flag('WHAM_USE_MEDIAPIPE', False)
     use_yolopose = env_flag('WHAM_USE_YOLOPOSE', False)
+    # Device the detector (YOLO/ViTPose) runs on. Defaults to the WHAM device;
+    # set WHAM_DET_DEVICE=cpu to move detection off the GPU and free it for WHAM.
+    det_device = os.environ.get('WHAM_DET_DEVICE', device)
+    # Device for the YOLO bbox stage only (ViTPose stays on det_device). Defaults
+    # to det_device; set WHAM_BBOX_DEVICE=cpu to run just the person-box detector
+    # on CPU while keeping the accurate ViTPose keypoint model on the GPU.
+    bbox_device = os.environ.get('WHAM_BBOX_DEVICE', det_device)
     detect_interval = max(1, int(os.environ.get('WHAM_DETECT_INTERVAL', '2')))
     infer_interval = max(1, int(os.environ.get('WHAM_INFER_INTERVAL', '1')))
     batch_k = max(1, int(os.environ.get('WHAM_BATCH_K', '1')))
@@ -509,7 +532,7 @@ def run_stream_mt(
     preview_max_h = max(240, int(os.environ.get('WHAM_PREVIEW_MAX_HEIGHT', '540')))
     logger.info(
         f"Perf opts: amp={int(use_amp)} detect_interval={detect_interval} "
-        f"infer_interval={infer_interval} batch_k={batch_k} seq_len={stream_seq_len} device={device} "
+        f"infer_interval={infer_interval} batch_k={batch_k} seq_len={stream_seq_len} device={device} det_device={det_device} bbox_device={bbox_device} "
         "stream_mode=tail"
     )
     heartbeat_frames = max(1, int(os.environ.get('PIPELINE_HEARTBEAT_FRAMES', '30')))
@@ -552,7 +575,7 @@ def run_stream_mt(
             'WHAM_YOLOPOSE_CKPT',
             os.path.join(root_dir, 'checkpoints', 'yolov8n-pose.pt'),
         )
-        detector = YOLOPoseDetector(device, model_ckpt=yolopose_ckpt)
+        detector = YOLOPoseDetector(det_device, model_ckpt=yolopose_ckpt)
         detect_interval = 1
         logger.info(f"Using YOLOv8-pose (single-stage) detector: {yolopose_ckpt}")
     elif use_mediapipe:
@@ -564,10 +587,11 @@ def run_stream_mt(
         logger.info("Using MediaPipe (CPU) detector via .venv_mp subprocess")
     else:
         detector = DetectionModel(
-            device,
+            det_device,
             pose_model_cfg=pose_model_cfg,
             pose_model_ckpt=pose_model_ckpt,
             bbox_model_ckpt=bbox_model_ckpt,
+            bbox_device=bbox_device,
         )
     extractor = FeatureExtractor(device, cfg.FLIP_EVAL)
     smpl = build_body_model('cpu')
@@ -1346,7 +1370,7 @@ def run_stream_mt(
                             bbox=bbox, res=res_batch.repeat(K, 1),
                             refine_traj=False, states=None)
                 _t_ms = (time.perf_counter() - _t0) * 1000
-                if pending[0][0] % 10 == 0:
+                if pending[0][0] % 10 < K:
                     logger.info(f"[WHAM] infer_ms={_t_ms:.1f}  batch={K}  frames={pending[0][0]}-{pending[-1][0]}")
                 for p in range(K):          # 按帧序 oldest -> newest 回放
                     j = K - 1 - p
@@ -1847,8 +1871,12 @@ def run_stream_mt(
             if getattr(gmr_args, 'robot_path', None) is not None:
                 v_kws['robot_path'] = gmr_args.robot_path
 
-            # On headless servers, use the minimal offscreen viewer (no GLFW needed)
-            if _is_headless and not gmr_args.record_gmrvideo:
+            # Headless offscreen path (no GLFW window). Recording via the GLFW
+            # RobotMotionViewer renders TWICE per frame (window + offscreen mp4),
+            # which doubles GPU load and latency; record headlessly unless the live
+            # window is explicitly requested (GMR_HEADLESS_RECORD=0).
+            _headless_record = gmr_args.record_gmrvideo and env_flag('GMR_HEADLESS_RECORD', True)
+            if _is_headless and (not gmr_args.record_gmrvideo or _headless_record):
                 try:
                     gmr_state["viewer"] = _HeadlessViewer(**v_kws)
                     logger.info(f"Initialized headless GMR viewer for {gmr_args.robot}")
@@ -1961,8 +1989,9 @@ def run_stream_mt(
             v_kws["robot_path"] = gmr_args.robot_path
 
         _is_headless = not os.environ.get("DISPLAY")
+        _headless_record = (gmr_args.record_gmrvideo and state["index"] == 0) and env_flag('GMR_HEADLESS_RECORD', True)
         try:
-            if _is_headless and not (gmr_args.record_gmrvideo and state["index"] == 0):
+            if _is_headless and (not (gmr_args.record_gmrvideo and state["index"] == 0) or _headless_record):
                 state["viewer"] = _HeadlessViewer(**v_kws)
                 logger.info(f"Initialized headless GMR viewer for {robot_key}")
             else:

@@ -35,7 +35,7 @@ MINIMUM_FRMAES = 30
 MINIMUM_JOINTS = 6
 
 class DetectionModel(object):
-    def __init__(self, device, pose_model_cfg=None, pose_model_ckpt=None, bbox_model_ckpt=None):
+    def __init__(self, device, pose_model_cfg=None, pose_model_ckpt=None, bbox_model_ckpt=None, bbox_device=None):
 
         # ViTPose
         if pose_model_ckpt is None:
@@ -79,6 +79,10 @@ class DetectionModel(object):
         self.bbox_model = YOLO(bbox_model_ckpt)
         
         self.device = device
+        # bbox (YOLO) can run on a separate device from the pose model (ViTPose):
+        # the bbox stage is a cheap person-box detector, so offloading it to CPU
+        # frees the GPU for ViTPose + WHAM without the ViTPose-on-CPU slowdown.
+        self.bbox_device = bbox_device if bbox_device is not None else device
         self.initialize_tracking()
         
     def initialize_tracking(self, ):
@@ -119,7 +123,7 @@ class DetectionModel(object):
         
         # bbox detection
         bboxes = self.bbox_model.predict(
-            img, device=self.device, classes=0, conf=BBOX_CONF, save=False, verbose=False
+            img, device=self.bbox_device, classes=0, conf=BBOX_CONF, save=False, verbose=False
         )[0].boxes.xyxy.detach().cpu().numpy()
         bboxes = [{'bbox': bbox} for bbox in bboxes]
         

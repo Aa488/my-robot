@@ -10,6 +10,8 @@ WORKDIR /opt/src/wham
 COPY handle_wham_gmr.py /opt/src/wham/handle_wham_gmr.py
 COPY run.sh /opt/src/wham/run.sh
 COPY docker/entrypoint.sh /opt/src/wham/docker/entrypoint.sh
+COPY assets/linglong2/linglong2.xml /opt/src/wham/assets/linglong2/linglong2.xml
+COPY general_motion_retargeting/robot_motion_viewer.py /opt/src/wham/general_motion_retargeting/robot_motion_viewer.py
 
 # Windows checkout strips the exec bit; the exec-form ENTRYPOINT needs it back.
 RUN chmod +x /opt/src/wham/docker/entrypoint.sh /opt/src/wham/run.sh

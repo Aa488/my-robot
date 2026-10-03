@@ -360,7 +360,7 @@ class _HeadlessViewer:
     """
 
     def __init__(self, robot_type, camera_follow=True, motion_fps=30,
-                 camera_lookat_height_offset=0.50, camera_elevation=-28.0,
+                 camera_lookat_height_offset=0.50, camera_elevation=0.0,
                  camera_distance_scale=1.70, camera_azimuth=None,
                  robot_path=None, **_kwargs):
         from general_motion_retargeting.params import ROBOT_XML_DICT, ROBOT_BASE_DICT, VIEWER_CAM_DISTANCE_DICT
@@ -2972,9 +2972,9 @@ if __name__ == '__main__':
     parser.add_argument("--no_tcp", dest="tcp", action="store_false")
     parser.set_defaults(tcp=False)
     parser.add_argument("--camera_lookat_height_offset", type=float, default=0.50)
-    parser.add_argument("--camera_elevation", type=float, default=-28.0)
+    parser.add_argument("--camera_elevation", type=float, default=0.0)
     parser.add_argument("--camera_distance_scale", type=float, default=1.70)
-    parser.add_argument("--camera_azimuth", type=float, default=None)
+    parser.add_argument("--camera_azimuth", type=float, default=90.0)
     parser.add_argument("--smooth_alpha", type=float, default=0.35)
     parser.add_argument("--height_adjust", action="store_true")
     parser.add_argument("--no-height_adjust", dest="height_adjust", action="store_false")

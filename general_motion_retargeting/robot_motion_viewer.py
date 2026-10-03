@@ -62,7 +62,7 @@ class RobotMotionViewer:
         keyboard_callback=None,
         robot_path=None,
         camera_lookat_height_offset=0.50,
-        camera_elevation=-28.0,
+        camera_elevation=0.0,
         camera_distance_scale=1.70,
         camera_azimuth=None,
     ):

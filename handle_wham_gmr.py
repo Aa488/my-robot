@@ -1131,11 +1131,17 @@ def run_stream_mt(
             if frame_id % heartbeat_frames == 0:
                 logger.info(f"[Input] queued frame={frame_id} read_Q={safe_qsize(read_Q)}")
             frame_id += 1
-        try:
-            read_Q.put(None, timeout=0.2)
-        except Exception:
-            pass
-    
+        # End-of-stream sentinel must never be dropped: read_Q may still be full
+        # (the reader races ahead of detection), so retry until a slot frees up
+        # instead of a single 0.2s put that silently loses the None and hangs
+        # the pipeline at shutdown.
+        while not stop_event.is_set():
+            try:
+                read_Q.put(None, timeout=0.1)
+                break
+            except Full:
+                continue
+
     def detector_thread():
         detector.initialize_tracking()
         selected_track_id = None
@@ -1150,10 +1156,12 @@ def run_stream_mt(
             except Empty:
                 continue
             if data is None:
-                try:
-                    det_Q.put(None, timeout=0.2)
-                except Exception:
-                    pass
+                while not stop_event.is_set():
+                    try:
+                        det_Q.put(None, timeout=0.1)
+                        break
+                    except Full:
+                        continue
                 break
 
             # Real-time (webcam only): the reader runs at camera rate (~30fps)
@@ -1243,10 +1251,12 @@ def run_stream_mt(
             except Empty:
                 continue
             if data is None:
-                try:
-                    ext_Q.put(None, timeout=0.2)
-                except Exception:
-                    pass
+                while not stop_event.is_set():
+                    try:
+                        ext_Q.put(None, timeout=0.1)
+                        break
+                    except Full:
+                        continue
                 break
             frame_id, start_time, frame, track_id, kp2d, bbox_c = data
             
@@ -1404,10 +1414,12 @@ def run_stream_mt(
             except Empty:
                 continue
             if data is None:
-                try:
-                    wham_Q.put(None, timeout=0.2)
-                except Exception:
-                    pass
+                while not stop_event.is_set():
+                    try:
+                        wham_Q.put(None, timeout=0.1)
+                        break
+                    except Full:
+                        continue
                 break
 
             # Real-time (webcam only): same bounded-backlog cap as the detector,
@@ -2248,7 +2260,13 @@ def run_stream_mt(
             r_diff = r_curr * r_prev.inv()
             angle = float(np.linalg.norm(r_diff.as_rotvec()))
             max_angle = np.deg2rad(20.0)
-            if angle > max_angle:
+            flip_angle = np.deg2rad(90.0)
+            if angle > flip_angle:
+                # 180° facing flip (WHAM front/back ambiguity): hold the previous
+                # root orientation instead of following the momentary wrong-facing
+                # estimate.  A genuine turn is smooth over many frames.
+                qp[3:7] = prev_q[[0, 1, 2, 3]].astype(qp.dtype)
+            elif angle > max_angle:
                 blend = float(max_angle / angle)
                 curr_q = prev_q + blend * (curr_q - prev_q)
                 curr_q /= np.linalg.norm(curr_q)
@@ -2525,8 +2543,17 @@ def run_stream_mt(
                     r_prev = R.from_quat(prev_q[[1, 2, 3, 0]])
                     r_diff = r_curr * r_prev.inv()
                     angle = float(np.linalg.norm(r_diff.as_rotvec()))
-                    max_angle = np.deg2rad(15.0)  # max 15 deg / frame
-                    if angle > max_angle:
+                    max_angle = np.deg2rad(15.0)  # max 15 deg / frame (genuine motion)
+                    flip_angle = np.deg2rad(90.0)  # near-180° flip = WHAM facing ambiguity
+                    if angle > flip_angle:
+                        # Single-frame >90° jump: WHAM momentarily estimated the
+                        # person facing the wrong way (front/back symmetric), so
+                        # hold the previous orientation instead of following it.
+                        # A genuine 180° turn is smooth over many frames, so a
+                        # one-frame >90° jump is always a WHAM error, not motion.
+                        pelvis_quat = prev_q
+                        sf["pelvis"] = (sf["pelvis"][0], pelvis_quat)
+                    elif angle > max_angle:
                         # Clamp: LERP toward previous quaternion, then normalize.
                         blend = float(max_angle / angle)
                         pelvis_quat = prev_q + blend * (pelvis_quat - prev_q)

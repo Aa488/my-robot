@@ -82,6 +82,8 @@ class RobotMotionViewer:
         self.camera_elevation = -abs(float(camera_elevation))
         self.camera_distance_scale = float(camera_distance_scale)
         self.camera_azimuth = camera_azimuth
+        self.camera_follow_smooth = float(os.environ.get("CAMERA_FOLLOW_SMOOTH", "0.25"))
+        self._cam_lookat_smooth = None
         self.record_video = record_video
         self.window_width = window_width
         self.window_height = window_height
@@ -250,7 +252,14 @@ class RobotMotionViewer:
 
             if follow_camera:
                 lookat, radius = self._camera_lookat_from_robot_bounds()
-                self.viewer.cam.lookat[:] = lookat
+                # Low-pass the follow-camera look-at so WHAM root-translation
+                # jitter doesn't shake the background.
+                if self._cam_lookat_smooth is None:
+                    self._cam_lookat_smooth = lookat.astype(np.float64).copy()
+                else:
+                    a = self.camera_follow_smooth
+                    self._cam_lookat_smooth = a * lookat + (1.0 - a) * self._cam_lookat_smooth
+                self.viewer.cam.lookat[:] = self._cam_lookat_smooth
                 base_distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
                 self.viewer.cam.distance = max(base_distance, radius * 2.7)
                 self.viewer.cam.elevation = self.camera_elevation

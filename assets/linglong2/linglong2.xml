@@ -49,9 +49,9 @@
 
   <worldbody>
     <geom name="floor" size="0 0 0.01" type="plane" rgba="0.88 0.88 0.88 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
-    <!-- 全局均匀光：去掉 castshadow，主光 + 反向补光 + 高 ambient，机器人位移后亮度不变 -->
-    <light diffuse=".55 .55 .55" ambient=".35 .35 .35" specular=".2 .2 .2" pos="-3 -3 5" dir=" 3  3 -5"/>
-    <light diffuse=".35 .35 .35" pos=" 3  3 5" dir="-3 -3 -5"/>
+    <!-- 全局均匀光：方向光（directional=true）平行光，机器人位移后亮度不变（点光/锥形光会在机器人走出光锥后变暗） -->
+    <light directional="true" diffuse=".42 .42 .42" ambient=".24 .24 .24" specular=".12 .12 .12" dir=" 3  3 -5"/>
+    <light directional="true" diffuse=".26 .26 .26" dir="-3 -3 -5"/>
 
     <!-- Root: base_link -->
     <body name="base_link" pos="0 0 0.85">

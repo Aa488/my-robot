@@ -337,7 +337,7 @@ except Exception as e:
 import imageio
 from collections import deque
 from lib.data.utils.normalizer import Normalizer
-from lib.utils.transforms import matrix_to_axis_angle
+from lib.utils.transforms import matrix_to_axis_angle, matrix_to_quaternion, quaternion_to_axis_angle
 from lib.models import build_network, build_body_model
 from lib.models.preproc.detector import DetectionModel
 from lib.models.preproc.extractor import FeatureExtractor
@@ -379,8 +379,6 @@ class _HeadlessViewer:
         self.camera_elevation = -abs(float(camera_elevation))
         self.camera_distance_scale = float(camera_distance_scale)
         self.camera_azimuth = camera_azimuth
-        self.camera_follow_smooth = float(os.environ.get("CAMERA_FOLLOW_SMOOTH", "0.25"))
-        self._cam_lookat_smooth = None
 
         self._cam = mj.MjvCamera()
         self._cam.lookat[:] = [0.0, 0.0, 1.0]
@@ -397,9 +395,6 @@ class _HeadlessViewer:
         self.mp4_writer = None
         if record_video:
             import imageio
-            video_dir = os.path.dirname(os.path.abspath(video_path))
-            if video_dir and not os.path.isdir(video_dir):
-                os.makedirs(video_dir, exist_ok=True)
             self.mp4_writer = imageio.get_writer(video_path, fps=motion_fps)
             self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
 
@@ -422,14 +417,7 @@ class _HeadlessViewer:
 
     def _update_follow_camera(self):
         lookat, radius = self._camera_lookat_from_robot_bounds()
-        # Low-pass the follow-camera look-at so WHAM root-translation jitter
-        # (horizontal + residual vertical) doesn't shake the background.
-        if self._cam_lookat_smooth is None:
-            self._cam_lookat_smooth = lookat.astype(np.float64).copy()
-        else:
-            a = self.camera_follow_smooth
-            self._cam_lookat_smooth = a * lookat + (1.0 - a) * self._cam_lookat_smooth
-        self._cam.lookat[:] = self._cam_lookat_smooth
+        self._cam.lookat[:] = lookat
         base_distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
         self._cam.distance = max(base_distance, radius * 2.7)
         self._cam.elevation = self.camera_elevation
@@ -886,13 +874,26 @@ def run_stream_mt(
         padded[:betas.numel()] = betas
         return padded
 
+    def _matrix_to_axis_angle_canonical(mat):
+        # matrix_to_axis_angle does matrix -> quaternion -> axis-angle. The
+        # quaternion's real part q_w can be negative (matrix_to_quaternion does not
+        # canonicalize the sign), which pushes quaternion_to_axis_angle's angle into
+        # the non-canonical (pi, 2*pi] branch. That branch is a 2*pi wrap that is
+        # non-deterministic under CUDA and introduces frame-to-frame 2*pi jumps in
+        # the body joint angles (visible as stiff / sign-flipped wrist motion).
+        # Negating the quaternion when q_w < 0 keeps the SAME rotation but yields a
+        # canonical angle in [0, pi], removing the wrap deterministically.
+        q = matrix_to_quaternion(mat)
+        q = torch.where(q[..., :1] < 0, -q, q)
+        return quaternion_to_axis_angle(q)
+
     def extract_latest_smplx_params(pred):
         body_pose_mat = extract_latest_body_pose(pred['poses_body'])
         root_cam_mat = extract_latest_root_pose(pred['poses_root_cam'])
         trans_cam = extract_latest_vec(pred['trans_cam'], 'trans_cam')
         betas = to_betas10(extract_latest_vec(pred['betas'], 'betas'))
 
-        body_pose_aa = to_body_pose63(matrix_to_axis_angle(body_pose_mat).reshape(-1))
+        body_pose_aa = to_body_pose63(_matrix_to_axis_angle_canonical(body_pose_mat).reshape(-1))
         _ = matrix_to_axis_angle(root_cam_mat).reshape(-1)
 
         if 'poses_root_world' in pred:
@@ -1690,7 +1691,6 @@ def run_stream_mt(
         # Root orientation tracking for continuity across WHAM windows.
         # WHAM root orientation also resets per window; clamp large jumps.
         "prev_pelvis_quat": None,        # xyzw quaternion
-        "prev_pelvis_pos_held": None,    # last accepted root translation (3,), for bad-frame hold
     })
     csv_flush_rows = max(1, int(os.environ.get("CSV_FLUSH_ROWS", "5")))
     csv_flush_interval = max(0.01, float(os.environ.get("CSV_FLUSH_INTERVAL_MS", "100")) / 1000.0)
@@ -2273,13 +2273,7 @@ def run_stream_mt(
             r_diff = r_curr * r_prev.inv()
             angle = float(np.linalg.norm(r_diff.as_rotvec()))
             max_angle = np.deg2rad(20.0)
-            flip_angle = np.deg2rad(90.0)
-            if angle > flip_angle:
-                # 180° facing flip (WHAM front/back ambiguity): hold the previous
-                # root orientation instead of following the momentary wrong-facing
-                # estimate.  A genuine turn is smooth over many frames.
-                qp[3:7] = prev_q[[0, 1, 2, 3]].astype(qp.dtype)
-            elif angle > max_angle:
+            if angle > max_angle:
                 blend = float(max_angle / angle)
                 curr_q = prev_q + blend * (curr_q - prev_q)
                 curr_q /= np.linalg.norm(curr_q)
@@ -2477,10 +2471,6 @@ def run_stream_mt(
                 _bench_no_vel  = os.environ.get("BENCH_DISABLE_VEL_INTEGRATION", "0") == "1"
                 _bench_no_disp = os.environ.get("BENCH_DISABLE_DISP_THRESH", "0") == "1"
                 _bench_no_quat = os.environ.get("BENCH_DISABLE_QUAT_CLAMP", "0") == "1"
-                # Single-frame root translation jump above this (metres) is a
-                # WHAM bad-frame spike (frame-770-style -21cm root-z); hold the
-                # previous position instead of following it.
-                _trans_flip_max = float(os.environ.get("BENCH_TRANS_FLIP_MAX", "0.12"))
 
                 # WHAM resets trans_world (cumsum from zero) each sliding window
                 # because we call with states=None.  Integrate root velocity
@@ -2511,7 +2501,6 @@ def run_stream_mt(
                     gmr_state["global_pelvis_pos"] = curr_raw.copy()
                     gmr_state["prev_raw_pelvis_pos"] = curr_raw.copy()
                     gmr_state["prev_frame_id"] = frame_id
-                    gmr_state["prev_pelvis_pos_held"] = curr_raw.copy()
                 elif not _bench_no_vel:
                     # Prefer the foot-contact de-biased velocity; fall back to
                     # raw vel_root for WHAM builds without vel_root_reset (or
@@ -2540,19 +2529,6 @@ def run_stream_mt(
                     gmr_state["prev_raw_pelvis_pos"] = curr_raw.copy()
                     gmr_state["prev_frame_id"] = frame_id
 
-                    # Root translation single-frame hold: a >~12cm one-frame
-                    # jump is a WHAM bad-frame spike (front/back or origin
-                    # glitch), not human motion — hold the previous position so
-                    # it never reaches the robot / follow-camera.  Complements
-                    # the orientation flip-hold below (which holds quat only).
-                    _prev_held = gmr_state.get("prev_pelvis_pos_held")
-                    if _prev_held is not None:
-                        _trans_delta = float(np.linalg.norm(
-                            gmr_state["global_pelvis_pos"] - _prev_held))
-                        if _trans_delta > _trans_flip_max:
-                            gmr_state["global_pelvis_pos"] = _prev_held.copy()
-                    gmr_state["prev_pelvis_pos_held"] = gmr_state["global_pelvis_pos"].copy()
-
                     # Shift all joint positions to the integrated global position.
                     offset = gmr_state["global_pelvis_pos"] - curr_raw
                     if float(np.linalg.norm(offset)) > 1e-6:
@@ -2574,17 +2550,8 @@ def run_stream_mt(
                     r_prev = R.from_quat(prev_q[[1, 2, 3, 0]])
                     r_diff = r_curr * r_prev.inv()
                     angle = float(np.linalg.norm(r_diff.as_rotvec()))
-                    max_angle = np.deg2rad(15.0)  # max 15 deg / frame (genuine motion)
-                    flip_angle = np.deg2rad(90.0)  # near-180° flip = WHAM facing ambiguity
-                    if angle > flip_angle:
-                        # Single-frame >90° jump: WHAM momentarily estimated the
-                        # person facing the wrong way (front/back symmetric), so
-                        # hold the previous orientation instead of following it.
-                        # A genuine 180° turn is smooth over many frames, so a
-                        # one-frame >90° jump is always a WHAM error, not motion.
-                        pelvis_quat = prev_q
-                        sf["pelvis"] = (sf["pelvis"][0], pelvis_quat)
-                    elif angle > max_angle:
+                    max_angle = np.deg2rad(15.0)  # max 15 deg / frame
+                    if angle > max_angle:
                         # Clamp: LERP toward previous quaternion, then normalize.
                         blend = float(max_angle / angle)
                         pelvis_quat = prev_q + blend * (pelvis_quat - prev_q)

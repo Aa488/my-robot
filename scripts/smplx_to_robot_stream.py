@@ -1,7 +1,6 @@
 import argparse
 import csv
 import inspect
-import math
 import os
 import pickle
 import pathlib
@@ -149,12 +148,6 @@ class OnlineQposPostprocessor:
     ):
         self.smooth_alpha = float(smooth_alpha)
         self.arm_smooth_alpha = float(arm_smooth_alpha)
-        # A planted foot tilted by more than this (forward-axis pitch vs the floor)
-        # is treated as an intentional tiptoe / heel-lift and left alone, rather
-        # than flattened.  A small tilt is the WHAM "toe-down" estimation error
-        # that _flatten_stance_feet corrects; a large one is deliberate.  Override
-        # with GMR_MAX_FOOT_TILT_DEG (degrees).
-        self.max_foot_tilt_rad = np.deg2rad(float(os.environ.get("GMR_MAX_FOOT_TILT_DEG", "10.0")))
         self.height_adjust = bool(height_adjust)
         self.root_origin_offset = bool(root_origin_offset)
         # Jump detection for height_adjust.  The raw lowest-foot height sits well
@@ -168,26 +161,10 @@ class OnlineQposPostprocessor:
             if airborne_threshold is not None
             else os.environ.get("GMR_AIRBORNE_THRESHOLD", "0.03")
         )
-        # Landing hysteresis: once airborne we stay airborne until lift falls below
-        # this (metres), so a single-frame dip cannot toggle the root mid-jump.
-        self.airborne_land_threshold = float(
-            os.environ.get("GMR_AIRBORNE_LAND_THRESHOLD", "0.015")
-        )
-        # Per-frame cap on the root (pelvis) height change (metres).  WHAM's
-        # front/back ambiguity can corrupt a single frame's root translation (the
-        # orientation is held, but the translation still spikes), and the airborne
-        # path above follows the raw root, so a lone ~20 cm spike can slip through.
-        # This clips such single-frame spikes without touching the joint angles.
-        # Override with GMR_MAX_ROOT_DZ_CM (centimetres).
-        self.max_root_dz = float(os.environ.get("GMR_MAX_ROOT_DZ_CM", "5.0")) / 100.0
-        # Running "ground" reference = a one-pole low-pass of the lowest-foot
-        # height: it tracks downward fast (follow a landing) but not instantly, and
-        # upward more slowly, so a single-frame WHAM noise spike cannot yank it down
-        # and be misread as a jump on recovery.  A warmup counter skips the first
-        # few frames (the IK/pelvis pose has not settled yet, giving a bogus
-        # lowest-height like -0.79 on frame 0).
+        # Running lower envelope of the lowest-foot height (ground reference) and a
+        # warmup counter that skips the first few frames (the IK/pelvis pose has not
+        # settled yet, giving a bogus lowest-height like -0.79 on frame 0).
         self._foot_ground_ref = None
-        self._airborne = False
         self._ground_warmup = 10
         self.prev_qpos = None
         self.xy_origin = None
@@ -366,25 +343,6 @@ class OnlineQposPostprocessor:
             self._dof_hi = hi.detach().cpu().numpy().astype(np.float64)
         return self._dof_lo, self._dof_hi
 
-    def _any_foot_tiptoe(self, m, d, stance_clearance=0.03):
-        """True when any foot is planted on its ball with the heel clearly raised.
-
-        A planted foot whose forward axis is pitched beyond ``max_foot_tilt_rad``
-        from horizontal is a deliberate tiptoe / heel-lift (the ball touches the
-        floor but the heel does not), not the small toe-down tilt that
-        ``_flatten_stance_feet`` exists to correct."""
-        if not self._foot_pitch_chain:
-            return False
-        limit = math.sin(self.max_foot_tilt_rad)
-        for c in self._foot_pitch_chain:
-            if self._sole_lowest_z(m, d, c["foot_body"]) > stance_clearance:
-                continue  # swing foot (not planted)
-            bid = self._mj_body_id(c["foot_body"])
-            fz = float(d.xmat[bid].reshape(3, 3)[:, 0][2])
-            if abs(fz) > limit:
-                return True
-        return False
-
     def _flatten_stance_feet(self, q, stance_clearance=0.03, blend=0.6, max_step=0.3):
         """Rotate each planted foot's ankle-pitch so its sole sits flat on the ground.
 
@@ -409,8 +367,6 @@ class OnlineQposPostprocessor:
             dof = c["ankle_pitch"]
             fwd = d.xmat[bid].reshape(3, 3)[:, 0]  # world forward (local +x)
             fz = float(fwd[2])
-            if abs(fz) > math.sin(self.max_foot_tilt_rad):
-                continue  # deliberate tiptoe / heel-lift — preserve, don't flatten
             if abs(fz) < 1e-4:
                 continue
             # Numerical Jacobian: d(fwd_z) / d(ankle_pitch).
@@ -635,47 +591,37 @@ class OnlineQposPostprocessor:
 
         if self.height_adjust:
             lowest_height = self._forward_kinematics_for_height(q)
-            # _forward_kinematics_for_height already ran MuJoCo FK with this q, so
-            # the cached mj data is current; reuse it to spot a planted tiptoe.
-            _m, _d = self._get_mj_model()
-            _tiptoe = self._any_foot_tiptoe(_m, _d)
-            # Track a running "ground" reference = a one-pole low-pass of the
-            # lowest-foot height: it follows a landing fast (rate 0.5) and a
-            # recovery more slowly (rate 0.15), so a single-frame WHAM noise spike
-            # cannot yank the reference down and be misread as a jump on recovery.
-            # The first few frames settle the reference (the IK/pelvis pose has not
-            # converged yet), grounding fully.
-            lift = 0.0
+            # Track a running "ground" reference = lower envelope of the lowest-foot
+            # height: it drops instantly to new lows and creeps upward slowly (3% of
+            # the gap per call).  The jump is measured as the *rise* of the foot
+            # above this envelope, so it is drift-free despite the source/robot
+            # pelvis offset.  The first few frames are used only to settle the
+            # reference (the pose/root has not converged yet), grounding fully.
             if self._ground_warmup > 0:
                 self._ground_warmup -= 1
                 self._foot_ground_ref = float(lowest_height)
-                self._airborne = False
-            elif self._foot_ground_ref is None:
-                self._foot_ground_ref = float(lowest_height)
+                lift = 0.0
+                w = 1.0
             else:
-                if not _tiptoe:
-                    err = float(lowest_height) - self._foot_ground_ref
-                    rate = 0.5 if err < 0.0 else 0.15
-                    self._foot_ground_ref += rate * err
+                if self._foot_ground_ref is None:
+                    self._foot_ground_ref = float(lowest_height)
+                elif float(lowest_height) < self._foot_ground_ref:
+                    self._foot_ground_ref = float(lowest_height)
+                else:
+                    self._foot_ground_ref += 0.03 * (float(lowest_height) - self._foot_ground_ref)
                 lift = float(lowest_height - self._foot_ground_ref)
-                # Airborne latch with hysteresis: enter only above the threshold,
-                # leave only below the (lower) landing threshold.  A binary decision
-                # (rather than the old smooth blend) stops the root from bobbing in
-                # the noise zone between the two thresholds.
-                if self._airborne:
-                    if lift < self.airborne_land_threshold:
-                        self._airborne = False
-                elif lift > self.airborne_threshold:
-                    self._airborne = True
-            # Desired lowest-foot height: sole on the floor when grounded (the old
-            # pre-jump-detection behaviour), or the foot's own height when airborne
-            # so a jump-in-place keeps its vertical root motion.
-            target = float(lowest_height) if self._airborne else self.sole_offset
+                lo = max(0.0, self.airborne_threshold - 0.015)
+                hi = self.airborne_threshold + 0.015
+                w = float(np.clip((hi - lift) / max(hi - lo, 1e-6), 0.0, 1.0))
+            # Desired lowest-foot height: sole on the floor normally, but rising
+            # with the jump (lift) once airborne so the vertical root motion is
+            # preserved instead of being erased by grounding.
+            target = self.sole_offset + (1.0 - w) * lift
             q[2] -= float(lowest_height) - target
             if os.environ.get("GMR_DEBUG_AIRBORNE", "0") == "1":
                 print(
                     f"[AIRBORNE-DBG] lowest={lowest_height:.3f} sole={self.sole_offset:.3f} "
-                    f"ground_ref={self._foot_ground_ref:.3f} lift={lift:.3f} airborne={self._airborne} "
+                    f"ground_ref={self._foot_ground_ref:.3f} lift={lift:.3f} w={w:.2f} "
                     f"target={target:.3f} root_z={float(q[2]):.3f}",
                     flush=True,
                 )
@@ -702,15 +648,6 @@ class OnlineQposPostprocessor:
                 q[self.X02LITE_R_ELBOW_QPOS_INDEX],
                 self.X02LITE_R_ELBOW_SOFT_MAX_RAD,
             )
-
-        # Clip the per-frame root-height change (final qpos, after height_adjust) so
-        # a single corrupted frame cannot drop/raise the pelvis by tens of cm.  This
-        # is a root-only guard; the per-joint clamp that used to live here was
-        # removed to restore natural arm motion.
-        if self.prev_qpos is not None and self.smooth_alpha < 0.999:
-            dz = q[2] - self.prev_qpos[2]
-            dz = np.clip(dz, -self.max_root_dz, self.max_root_dz)
-            q[2] = self.prev_qpos[2] + dz
 
         self.prev_qpos = q.copy()
         return q

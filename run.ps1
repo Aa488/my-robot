@@ -202,7 +202,7 @@ $IDLE_TIMEOUT          = _env IDLE_TIMEOUT          "0"
 $DONE_GRACE_SEC        = _env DONE_GRACE_SEC        "2.0"
 
 # WHAM performance controls.
-$WHAM_USE_AMP          = _env WHAM_USE_AMP          "1"
+$WHAM_USE_AMP          = _env WHAM_USE_AMP          "0"
 $WHAM_USE_MEDIAPIPE    = _env WHAM_USE_MEDIAPIPE    "0"
 $WHAM_USE_YOLOPOSE     = _env WHAM_USE_YOLOPOSE     "0"
 $WHAM_MEDIAPIPE_COMPLEXITY = _env WHAM_MEDIAPIPE_COMPLEXITY "0"

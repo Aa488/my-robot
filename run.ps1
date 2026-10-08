@@ -203,10 +203,15 @@ $DONE_GRACE_SEC        = _env DONE_GRACE_SEC        "2.0"
 
 # WHAM performance controls.
 $WHAM_USE_AMP          = _env WHAM_USE_AMP          "0"
+# Detector: single-stage YOLOv8-pose by default (~27ms/frame, bbox+17 keypoints in
+# one forward). The default YOLOv8n-bbox + ViTPose path was the real-time bottleneck
+# (~4fps) because the bbox stage ran on CPU. Set WHAM_USE_YOLOPOSE=0 to fall back,
+# or WHAM_USE_MEDIAPIPE=1 for the CPU BlazePose subprocess detector.
 $WHAM_USE_MEDIAPIPE    = _env WHAM_USE_MEDIAPIPE    "0"
-$WHAM_USE_YOLOPOSE     = _env WHAM_USE_YOLOPOSE     "0"
+$WHAM_USE_YOLOPOSE     = _env WHAM_USE_YOLOPOSE     "1"
 $WHAM_MEDIAPIPE_COMPLEXITY = _env WHAM_MEDIAPIPE_COMPLEXITY "0"
 $WHAM_DETECT_INTERVAL  = _env WHAM_DETECT_INTERVAL  "1"
+# Only used by the default YOLOv8n+ViTPose path (ignored when WHAM_USE_YOLOPOSE=1).
 $WHAM_BBOX_DEVICE      = _env WHAM_BBOX_DEVICE      "cpu"
 $WHAM_INFER_INTERVAL   = _env WHAM_INFER_INTERVAL   "1"
 $WHAM_STREAM_SEQ_LEN   = _env WHAM_STREAM_SEQ_LEN   "16"

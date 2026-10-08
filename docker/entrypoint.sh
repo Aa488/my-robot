@@ -35,9 +35,11 @@ export GMR_HEADLESS_RECORD="${GMR_HEADLESS_RECORD:-1}"
 export USE_XVFB_GMR="${USE_XVFB_GMR:-1}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
-# Performance defaults (override with -e): fp16 WHAM on GPU, GMR IK on CPU,
-# YOLO bbox detector on CPU (ViTPose stays on GPU).
-export WHAM_USE_AMP="${WHAM_USE_AMP:-1}"
+# Performance defaults (override with -e): WHAM on GPU with fp16 OFF (fp16 caused
+# arm jumps), GMR IK on CPU. WHAM_BBOX_DEVICE only affects the fallback YOLOv8n+
+# ViTPose detector — the default single-stage YOLOv8-pose (WHAM_USE_YOLOPOSE=1 in
+# run.sh) ignores it.
+export WHAM_USE_AMP="${WHAM_USE_AMP:-0}"
 export WHAM_BBOX_DEVICE="${WHAM_BBOX_DEVICE:-cpu}"
 export GMR_TORCH_DEVICE="${GMR_TORCH_DEVICE:-cpu}"
 

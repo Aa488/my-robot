@@ -189,3 +189,5 @@ gzip -dc wham-gmr_local.tar.gz | docker load
 
 - 当前 Dockerfile 默认优先覆盖 `run.sh` 所需链路；`demo.py` 完整 SLAM 路径若需 DPVO CUDA 编译，可在镜像内按 `third-party/DPVO` 的官方步骤补装。
 - 项目目录通过 volume 挂载到容器 `/workspace`
+
+最低延迟模式可设置 `WHAM_LATEST_FRAME_KEEP=1 WHAM_ADAPTIVE_KEEP=0`。此时四段 webcam 队列在写入时替换旧帧，慢阶段恢复后直接取最新帧；中间动作会被跳过。默认的自适应窗口仍保留多帧以维持快速动作的连续性。

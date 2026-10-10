@@ -23,6 +23,7 @@ from general_motion_retargeting import RobotMotionViewer
 from general_motion_retargeting.kinematics_model import KinematicsModel
 from scripts.smplx_to_robot_stream import OnlineQposPostprocessor
 from scripts.pipeline_watchdog import PipelineProgress
+from scripts.latest_frame_queue import LatestFrameQueue
 
 SMPLX_FOLDER = HERE / "assets" / "body_models"
 
@@ -746,11 +747,26 @@ def run_stream_mt(
         logger.info(f"Tail stream enabled: {tail_writer.tail_path} (flush_interval={tail_writer.flush_interval})")
 
 
+    latest_frame_keep = max(1, int(os.environ.get("WHAM_LATEST_FRAME_KEEP", "3")))
+    adaptive_keep_enabled = (
+        is_webcam
+        and os.environ.get("WHAM_LATEST_FRAME", "1") != "0"
+        and env_flag("WHAM_ADAPTIVE_KEEP", True)
+    )
+
     # Queues for pipeline
-    read_Q = Queue(maxsize=pipeline_queue_size)
-    det_Q = Queue(maxsize=pipeline_queue_size)
-    ext_Q = Queue(maxsize=pipeline_queue_size)
-    wham_Q = Queue(maxsize=pipeline_queue_size)
+    # The one-frame, non-adaptive webcam mode should replace stale frames at
+    # enqueue time. The regular queue remains for file input and wider motion
+    # windows, where retaining intermediate frames is intentional.
+    latest_webcam = (
+        is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0"
+        and latest_frame_keep == 1 and not adaptive_keep_enabled
+    )
+    frame_queue = LatestFrameQueue if latest_webcam else lambda: Queue(maxsize=pipeline_queue_size)
+    read_Q = frame_queue()
+    det_Q = frame_queue()
+    ext_Q = frame_queue()
+    wham_Q = frame_queue()
     render_Q = Queue(maxsize=max(2, int(os.environ.get('WHAM_RENDER_QUEUE_SIZE', '16'))))
     render_thread = None
     render_drop_count = 0
@@ -773,7 +789,6 @@ def run_stream_mt(
     # still flow through in FIFO order (dense trajectory), just with a bounded
     # lag of `latest_frame_keep` frames. Tune up for smoother motion / down for
     # lower latency. Opt out entirely with WHAM_LATEST_FRAME=0.
-    latest_frame_keep = max(1, int(os.environ.get("WHAM_LATEST_FRAME_KEEP", "3")))
 
     # Adaptive backlog window (webcam only): fast motions like jumps have
     # short-lived peaks (apex, max velocity) that a small fixed window tends to
@@ -781,11 +796,6 @@ def run_stream_mt(
     # WHAM_ADAPTIVE_SPEED_THRESHOLD, widen the window to WHAM_ADAPTIVE_FAST_KEEP
     # (accept a bit more latency to keep more frames); when slow, shrink back to
     # `latest_frame_keep` for low latency. Opt out with WHAM_ADAPTIVE_KEEP=0.
-    adaptive_keep_enabled = (
-        is_webcam
-        and os.environ.get("WHAM_LATEST_FRAME", "1") != "0"
-        and env_flag("WHAM_ADAPTIVE_KEEP", True)
-    )
     adaptive_fast_keep = max(latest_frame_keep, int(os.environ.get("WHAM_ADAPTIVE_FAST_KEEP", "8")))
     adaptive_speed_thresh = float(os.environ.get("WHAM_ADAPTIVE_SPEED_THRESHOLD", "1.5"))
     adaptive_max_step = float(os.environ.get("WHAM_ADAPTIVE_MAX_STEP", "0.5"))
@@ -1240,7 +1250,7 @@ def run_stream_mt(
             # backlog to a small window so detection doesn't replay a long queue,
             # while keeping a few frames in FIFO order for a dense trajectory.
             # Disabled for file video; opt out with WHAM_LATEST_FRAME=0.
-            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
+            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0" and not latest_webcam:
                 _cap_queue_backlog(read_Q, adaptive_keep[0], upstream_drop_count)
 
             frame_id, start_time, frame = data
@@ -1346,7 +1356,7 @@ def run_stream_mt(
             # extractor always consumes the freshest detection instead of
             # replaying a backlog that builds up when detection outruns feature
             # extraction (GPU contention). Mirrors the read_Q / ext_Q caps.
-            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
+            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0" and not latest_webcam:
                 _cap_queue_backlog(det_Q, adaptive_keep[0], upstream_drop_count)
 
             frame_id, start_time, frame, track_id, kp2d, bbox_c = data
@@ -1521,7 +1531,7 @@ def run_stream_mt(
             # Real-time (webcam only): same bounded-backlog cap as the detector,
             # but at WHAM's input — if WHAM inference is the bottleneck relative
             # to the extractor, ext_Q backs up with stale frames.
-            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
+            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0" and not latest_webcam:
                 _cap_queue_backlog(ext_Q, adaptive_keep[0], upstream_drop_count)
 
             frame_id, start_time, frame, track_id, kp2d, bbox_c, feature, init_data = data
@@ -2797,7 +2807,7 @@ def run_stream_mt(
             e2e_p95 = float(np.percentile(e2e_vals, 95)) if len(e2e_vals) >= 20 else (float(np.max(e2e_vals)) if e2e_vals else 0.0)
             logger.info(
                 f"[Heartbeat] frame={frame_id} wham_fps={avg_fps:.2f} latency={latency:.2f}s "
-                f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)} main_drop={main_drop_count} front_drop={upstream_drop_count[0]} keep={adaptive_keep[0]} speed={gmr_state.get('ema_speed', 0.0):.2f} "
+                f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)} main_drop={main_drop_count} front_drop={upstream_drop_count[0] + sum(getattr(q, 'dropped', 0) for q in (read_Q, det_Q, ext_Q, wham_Q))} keep={adaptive_keep[0]} speed={gmr_state.get('ema_speed', 0.0):.2f} "
                 f"adapt_ms={mean_adapt:.1f} ik_ms={mean_ik:.1f} post_ms={mean_post:.1f} wham_wait_ms={mean_wham_wait:.1f} "
                 f"e2e_avg_ms={e2e_avg:.1f} e2e_p95_ms={e2e_p95:.1f} "
                 f"gmr_preview_fps={gmr_preview_fps:.2f} {robot_rows}"

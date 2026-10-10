@@ -2,6 +2,8 @@ import sys
 import argparse
 import time
 import os
+import faulthandler
+import subprocess
 import cv2
 import csv
 import json
@@ -20,6 +22,7 @@ from general_motion_retargeting import GeneralMotionRetargeting as GMR
 from general_motion_retargeting import RobotMotionViewer
 from general_motion_retargeting.kinematics_model import KinematicsModel
 from scripts.smplx_to_robot_stream import OnlineQposPostprocessor
+from scripts.pipeline_watchdog import PipelineProgress
 
 SMPLX_FOLDER = HERE / "assets" / "body_models"
 
@@ -751,6 +754,8 @@ def run_stream_mt(
     render_Q = Queue(maxsize=max(2, int(os.environ.get('WHAM_RENDER_QUEUE_SIZE', '16'))))
     render_thread = None
     render_drop_count = 0
+    progress = PipelineProgress()
+    watchdog_timeout_s = max(5.0, float(os.environ.get("PIPELINE_STALL_TIMEOUT_SEC", "15")))
     # Frames dropped by the front-of-pipeline latest-frame drain (webcam only),
     # incremented from the detector/wham threads so it lives in a mutable list.
     upstream_drop_count = [0]
@@ -990,6 +995,31 @@ def run_stream_mt(
     stop_event = threading.Event()
     terminal_stop_event = threading.Event()
 
+    def pipeline_watchdog():
+        while not stop_event.wait(1.0):
+            stalled = progress.stalled(watchdog_timeout_s)
+            if not stalled:
+                continue
+            last, busy = progress.snapshot()
+            logger.critical(f"[Watchdog] stalled={stalled} last={last} busy={busy}")
+            logger.critical(
+                f"[Watchdog] pid={os.getpid()} process_cpu_s={time.process_time():.1f} "
+                f"threads={threading.active_count()} load={os.getloadavg() if hasattr(os, 'getloadavg') else 'n/a'}"
+            )
+            try:
+                gpu = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader"],
+                    capture_output=True, text=True, timeout=3, check=False,
+                )
+                logger.critical(f"[Watchdog] GPU status: {gpu.stdout.strip() or gpu.stderr.strip()}")
+            except Exception as exc:
+                logger.warning(f"[Watchdog] GPU status unavailable: {exc}")
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            sys.stderr.flush()
+            # A native detector call cannot be stopped safely from another Python
+            # thread. The launcher restarts the entire process on this exit code.
+            os._exit(75)
+
     def terminal_key_listener():
         if not is_webcam or webcam_capture_time > 0:
             return
@@ -1146,6 +1176,7 @@ def run_stream_mt(
                 except Full:
                     continue
             logger.info(f"[Input] queued first frame={frame_id} read_Q={safe_qsize(read_Q)}")
+            progress.mark("input", frame_id)
             frame_id += 1
 
         while cap.isOpened() and not stop_event.is_set():
@@ -1167,6 +1198,7 @@ def run_stream_mt(
                     continue
             if frame_id % heartbeat_frames == 0:
                 logger.info(f"[Input] queued frame={frame_id} read_Q={safe_qsize(read_Q)}")
+            progress.mark("input", frame_id)
             frame_id += 1
         # End-of-stream sentinel must never be dropped: read_Q may still be full
         # (the reader races ahead of detection), so retry until a slot frees up
@@ -1211,6 +1243,7 @@ def run_stream_mt(
                 _cap_queue_backlog(read_Q, adaptive_keep[0], upstream_drop_count)
 
             frame_id, start_time, frame = data
+            progress.begin("detect", frame_id)
 
             track_id = None
             kp2d = None
@@ -1281,6 +1314,7 @@ def run_stream_mt(
                 # skips person-less frames).
                 if frame_id == 0 or frame_id % heartbeat_frames == 0:
                     logger.warning(f"[Detect] frame={frame_id} no person detected; dropped (not queued)")
+                progress.finish("detect", frame_id)
                 continue
 
             while not stop_event.is_set():
@@ -1289,6 +1323,7 @@ def run_stream_mt(
                     break
                 except Full:
                     continue
+            progress.finish("detect", frame_id)
             
     def extractor_thread():
         init_cache = {}
@@ -1314,6 +1349,7 @@ def run_stream_mt(
                 _cap_queue_backlog(det_Q, adaptive_keep[0], upstream_drop_count)
 
             frame_id, start_time, frame, track_id, kp2d, bbox_c = data
+            progress.begin("extract", frame_id)
             
             if track_id is not None:
                 cx, cy, scale = bbox_c
@@ -1350,6 +1386,7 @@ def run_stream_mt(
                         continue
                 if frame_id == 0 or frame_id % heartbeat_frames == 0:
                     logger.warning(f"[Extract] frame={frame_id} has no tracked person; ext_Q={safe_qsize(ext_Q)}")
+            progress.finish("extract", frame_id)
                 
     def build_wham_inits(init_data_hist, first_norm_kp2d):
         with torch.inference_mode():
@@ -1419,6 +1456,7 @@ def run_stream_mt(
         init_root_b = init_root.repeat(K, 1, 1)
         cam_angvel = torch.zeros((K, F, 6), device=device)
 
+        progress.begin("wham", pending[0][0])
         try:
             stream_ctx = torch.cuda.stream(wham_stream) if wham_stream is not None else nullcontext()
             with stream_ctx:
@@ -1459,6 +1497,8 @@ def run_stream_mt(
                         break
                     except Full:
                         continue
+        finally:
+            progress.finish("wham", pending[-1][0])
 
     def wham_thread():
         temporal_history = {}
@@ -1564,6 +1604,7 @@ def run_stream_mt(
                 inits = hist['cached_inits']
                 init_root = hist['cached_init_root']
 
+                progress.begin("wham", frame_id)
                 try:
                     stream_ctx = torch.cuda.stream(wham_stream) if wham_stream is not None else nullcontext()
                     with stream_ctx:
@@ -1609,6 +1650,8 @@ def run_stream_mt(
                             break
                         except Full:
                             continue
+                finally:
+                    progress.finish("wham", frame_id)
             else:
                 while not stop_event.is_set():
                     try:
@@ -1651,6 +1694,9 @@ def run_stream_mt(
     t2.start()
     t3.start()
     t4.start()
+    if is_webcam and env_flag("PIPELINE_WATCHDOG", True):
+        threading.Thread(target=pipeline_watchdog, daemon=True, name="pipeline-watchdog").start()
+        logger.info(f"[Watchdog] enabled timeout={watchdog_timeout_s:.1f}s")
     if terminal_listener is not None:
         terminal_listener.start()
     if record_whamvideo or preview_window_enabled:
@@ -2353,6 +2399,7 @@ def run_stream_mt(
             ):
                 csv_fh.flush()
                 state["last_csv_flush_time"] = now_for_flush
+            progress.mark(f"csv:{robot_key}", frame_id)
         csv_ms = (time.perf_counter() - _t0_csv) * 1000
 
         # Sidecar dump: WHAM source foot/ankle world positions, aligned to this
@@ -2411,6 +2458,7 @@ def run_stream_mt(
             if task is None:
                 break
             frame_id, start_time, sf, betas = task
+            progress.begin(f"gmr:{robot_key}", frame_id)
             try:
                 _process_gmr_worker_frame(state, frame_id, start_time, sf, betas)
             except KeyboardInterrupt:
@@ -2424,6 +2472,8 @@ def run_stream_mt(
                 if state.get("retarget") is None:
                     stop_event.set()
                     break
+            finally:
+                progress.finish(f"gmr:{robot_key}", frame_id)
         logger.info(f"[GMR] worker stopped robot={robot_key}")
 
     for state in gmr_states.values():
@@ -2500,6 +2550,7 @@ def run_stream_mt(
                 main_drop_count += 1
 
         frame_id, start_time, frame, success, verts_cam, pred_track_id, gvhmr_params = res_data
+        progress.mark("wham_output", frame_id)
         max_frame_id = max(max_frame_id, frame_id)
 
         if terminal_stop_event.is_set():

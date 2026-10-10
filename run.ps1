@@ -213,6 +213,9 @@ $WHAM_USE_AMP          = _env WHAM_USE_AMP          "0"
 # or WHAM_USE_MEDIAPIPE=1 for the CPU BlazePose subprocess detector.
 $WHAM_USE_MEDIAPIPE    = _env WHAM_USE_MEDIAPIPE    "0"
 $WHAM_USE_YOLOPOSE     = _env WHAM_USE_YOLOPOSE     "1"
+# YOLOv8-pose input size (ignored when WHAM_USE_YOLOPOSE=0). 320 cuts the YOLO
+# forward roughly in half; use only when the subject is close to the camera.
+$WHAM_YOLOPOSE_IMGSZ   = _env WHAM_YOLOPOSE_IMGSZ   "640"
 $WHAM_MEDIAPIPE_COMPLEXITY = _env WHAM_MEDIAPIPE_COMPLEXITY "0"
 $WHAM_DETECT_INTERVAL  = _env WHAM_DETECT_INTERVAL  "1"
 # Only used by the default YOLOv8n+ViTPose path (ignored when WHAM_USE_YOLOPOSE=1).
@@ -239,6 +242,7 @@ $WHAM_LOG              = _env WHAM_LOG              "1"
 $env:WHAM_USE_AMP         = $WHAM_USE_AMP
 $env:WHAM_USE_MEDIAPIPE   = $WHAM_USE_MEDIAPIPE
 $env:WHAM_USE_YOLOPOSE    = $WHAM_USE_YOLOPOSE
+$env:WHAM_YOLOPOSE_IMGSZ  = $WHAM_YOLOPOSE_IMGSZ
 $env:WHAM_MEDIAPIPE_COMPLEXITY = $WHAM_MEDIAPIPE_COMPLEXITY
 $env:WHAM_DETECT_INTERVAL = $WHAM_DETECT_INTERVAL
 $env:WHAM_BBOX_DEVICE   = $WHAM_BBOX_DEVICE
@@ -326,7 +330,7 @@ Remove-Item -Force -ErrorAction SilentlyContinue $STREAM_TAIL_PATH
 $_display = if ($env:DISPLAY) { $env:DISPLAY } else { '<unset>' }
 Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO GMR_HEADLESS_RECORD=$GMR_HEADLESS_RECORD vid_res=${GMR_VIEWER_MAX_WIDTH}x${GMR_VIEWER_MAX_HEIGHT} TCP=$TCP USE_XVFB_GMR=$USE_XVFB_GMR WHAM_PREVIEW=$(if ($WHAM_PREVIEW) { $WHAM_PREVIEW } else { '<follow-record>' }) DISPLAY=$_display"
 Write-Host "[E2E] Camera params: follow=$CAMERA_FOLLOW track=$TRACK lookat_h=$CAMERA_LOOKAT_HEIGHT_OFFSET elev=$CAMERA_ELEVATION dist_scale=$CAMERA_DISTANCE_SCALE azimuth=$(if ($CAMERA_AZIMUTH) { $CAMERA_AZIMUTH } else { '<auto>' })"
-Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP mediapipe=$WHAM_USE_MEDIAPIPE yolopose=$WHAM_USE_YOLOPOSE mp_complexity=$WHAM_MEDIAPIPE_COMPLEXITY detect_interval=$WHAM_DETECT_INTERVAL bbox_device=$WHAM_BBOX_DEVICE infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE dedicated_stream=$WHAM_DEDICATED_STREAM batch_k=$WHAM_BATCH_K latest_frame=$WHAM_LATEST_FRAME latest_frame_keep=$WHAM_LATEST_FRAME_KEEP adaptive_keep=$WHAM_ADAPTIVE_KEEP adaptive_fast_keep=$WHAM_ADAPTIVE_FAST_KEEP adaptive_speed_thresh=$WHAM_ADAPTIVE_SPEED_THRESHOLD"
+Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP mediapipe=$WHAM_USE_MEDIAPIPE yolopose=$WHAM_USE_YOLOPOSE yolopose_imgsz=$WHAM_YOLOPOSE_IMGSZ mp_complexity=$WHAM_MEDIAPIPE_COMPLEXITY detect_interval=$WHAM_DETECT_INTERVAL bbox_device=$WHAM_BBOX_DEVICE infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE dedicated_stream=$WHAM_DEDICATED_STREAM batch_k=$WHAM_BATCH_K latest_frame=$WHAM_LATEST_FRAME latest_frame_keep=$WHAM_LATEST_FRAME_KEEP adaptive_keep=$WHAM_ADAPTIVE_KEEP adaptive_fast_keep=$WHAM_ADAPTIVE_FAST_KEEP adaptive_speed_thresh=$WHAM_ADAPTIVE_SPEED_THRESHOLD"
 Write-Host "[E2E] WHAM stream mode=tail (fixed)"
 Write-Host "[E2E] GMR torch_device=$GMR_TORCH_DEVICE"
 Write-Host "[E2E] Source params: VIDEO=$VIDEO TIME=$TIME ROBOT=$ROBOT ROBOTS=$ROBOTS OUTPUT_ROOT=$(if ($OUTPUT_ROOT) { $OUTPUT_ROOT } else { '<default>' }) CSV_PATH=$CSV_PATH CSV_ROOT=$CSV_ROOT TCP=$TCP"

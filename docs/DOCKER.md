@@ -104,6 +104,7 @@ docker run --gpus all --rm -v $PWD/out:/output \
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `WHAM_USE_YOLOPOSE` | `1` | **默认单阶段 YOLOv8-pose**（~27ms/帧，bbox+17 关键点一次前向）。`0` 回退到 YOLOv8n+ViTPose |
+| `WHAM_YOLOPOSE_IMGSZ` | `640` | YOLOv8-pose 输入尺寸；`320` 把 YOLO 前向砍近半，仅适合人在近处（远处/小人召回会降） |
 | `WHAM_USE_MEDIAPIPE` | `0` | `1` 用 CPU BlazePose 子进程（释放 GPU） |
 | `WHAM_BBOX_DEVICE` | `cpu` | 仅默认 YOLO+ViTPose 路径用；YOLOPose=1 时忽略 |
 | `WHAM_DETECT_INTERVAL` | `1` | 每 N 帧检测一次（YOLOPose=1 时强制 1） |

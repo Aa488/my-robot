@@ -589,9 +589,12 @@ def run_stream_mt(
             'WHAM_YOLOPOSE_CKPT',
             os.path.join(root_dir, 'checkpoints', 'yolov8n-pose.pt'),
         )
-        detector = YOLOPoseDetector(det_device, model_ckpt=yolopose_ckpt)
+        # Lower imgsz (e.g. 320) cuts the YOLO forward cost at the price of small/
+        # distant person recall — fine when the subject is close to the camera.
+        yolopose_imgsz = max(128, int(os.environ.get('WHAM_YOLOPOSE_IMGSZ', '640')))
+        detector = YOLOPoseDetector(det_device, model_ckpt=yolopose_ckpt, imgsz=yolopose_imgsz)
         detect_interval = 1
-        logger.info(f"Using YOLOv8-pose (single-stage) detector: {yolopose_ckpt}")
+        logger.info(f"Using YOLOv8-pose (single-stage) detector: {yolopose_ckpt} imgsz={yolopose_imgsz}")
     elif use_mediapipe:
         # CPU BlazePose detector in a separate .venv_mp subprocess — frees the
         # GPU for the WHAM thread (removes the YOLO+ViTPose GPU contention).

@@ -46,6 +46,14 @@ $env:WHAM_BATCH_K = "2"   # run.ps1 已默认 2；直接 python 跑时 fallback 
   - `4`：71.9fps；`8`：144.9fps（延迟超预算，不建议）
 - 建议：实时模式固定 `2`。**若你直接 `python handle_wham_gmr.py`（不走 run.ps1），记得手动设 `$env:WHAM_BATCH_K="2"`**，否则回退到 1、又会丢帧。
 
+### WHAM_INFER_INTERVAL=2 —— WHAM 少参加推理（复用上一帧姿态）
+```powershell
+$env:WHAM_INFER_INTERVAL = "2"   # 默认 1（每帧都推理）
+```
+- 作用：WHAM 每 N 帧才真跑一次前向，中间帧直接复用上一帧的 3D 姿态（丢到 wham_Q）。`2` = WHAM 计算量减半。**现在 batch 模式（WHAM_BATCH_K=2）下也生效**。
+- 代价：中间帧姿态是「冻结」的上一帧，动作越快越显得卡顿。`2` 通常可接受，`3` 以上快速动作会明显抖。
+- 定位：这是你要的「WHAM 少参加推理」开关，比「完全跳过 WHAM」现实得多（跳过 WHAM 就没有 3D 姿态，GMR/IK 无输入）。
+
 ### WHAM_YOLOPOSE_IMGSZ=320 —— 砍 YOLO 前向（人在近处时）
 ```powershell
 $env:WHAM_YOLOPOSE_IMGSZ = "320"   # 默认 640
@@ -106,7 +114,7 @@ $env:GMR_HEADLESS_RECORD = "1"   # 你已设 0（弹窗）
 | `WHAM_BATCH_K` | `2` | 批量窗口推理，K=2 ~2× 吞吐、消除丢帧；`1` = 单窗口旧行为 |
 | `WHAM_INPUT_SCALE` | `1.0` | 输入缩放，<1 更快 |
 | `WHAM_STREAM_SEQ_LEN` | `16` | 滑窗长度，调小更快、时序更短 |
-| `WHAM_INFER_INTERVAL` | `1` | 推理间隔（>1 跳帧，降精度换吞吐） |
+| `WHAM_INFER_INTERVAL` | `1` | WHAM 推理间隔：`>1` 时中间帧复用上一帧 3D 姿态（batch 模式也生效），=「WHAM 少参加推理」 |
 | `WHAM_DEDICATED_STREAM` | `1` | 专用 CUDA stream（CUDA 设备生效） |
 
 ### 丢帧 / 积压（仅 `VIDEO=0` 生效）

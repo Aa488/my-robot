@@ -1493,6 +1493,31 @@ def run_stream_mt(
 
                 hist = temporal_history[track_id]
 
+                # WHAM_INFER_INTERVAL > 1: on non-interval frames reuse the last
+                # WHAM pose instead of running the network. Checked before the
+                # batch/single branches so it works in both modes, and skipped
+                # frames never enter the sliding window.
+                if infer_interval > 1 and (frame_id % infer_interval) != 0 and hist['last_pred'] is not None:
+                    last_verts_cam, last_smplx_params = hist['last_pred']
+                    while not stop_event.is_set():
+                        try:
+                            wham_Q.put(
+                                (
+                                    frame_id,
+                                    start_time,
+                                    frame,
+                                    True,
+                                    last_verts_cam.copy(),
+                                    track_id,
+                                    {k: v.copy() for k, v in last_smplx_params.items()},
+                                ),
+                                timeout=0.1,
+                            )
+                            break
+                        except Full:
+                            continue
+                    continue
+
                 if batch_k > 1:
                     hist['kp2d'].append(kp2d)
                     hist['bbox'].append(bbox_c)
@@ -1526,27 +1551,6 @@ def run_stream_mt(
                         norm_kp2d[0, 0].clone()
                     )
 
-                if infer_interval > 1 and (frame_id % infer_interval) != 0 and hist['last_pred'] is not None:
-                    last_verts_cam, last_smplx_params = hist['last_pred']
-                    while not stop_event.is_set():
-                        try:
-                            wham_Q.put(
-                                (
-                                    frame_id,
-                                    start_time,
-                                    frame,
-                                    True,
-                                    last_verts_cam.copy(),
-                                    track_id,
-                                    {k: v.copy() for k, v in last_smplx_params.items()},
-                                ),
-                                timeout=0.1,
-                            )
-                            break
-                        except Full:
-                            continue
-                    continue
-                
                 cam_angvel = torch.zeros((1, norm_kp2d.shape[1], 6), device=device)
                 
                 inits = hist['cached_inits']

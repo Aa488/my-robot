@@ -117,7 +117,7 @@ docker run --gpus all --rm -v $PWD/out:/output \
 | `WHAM_USE_AMP` | `0` | fp16。**保持 0**——开 1 会引出手臂跳变 |
 | `WHAM_BATCH_K` | `2` | 批量窗口推理，K=2 约 2× 吞吐；`1` = 旧行为 |
 | `WHAM_STREAM_SEQ_LEN` | `16` | 滑窗长度 |
-| `WHAM_INFER_INTERVAL` | `1` | 推理间隔 |
+| `WHAM_INFER_INTERVAL` | `1` | WHAM 推理间隔：`>1` 中间帧复用上一帧 3D 姿态（batch 模式也生效），=「WHAM 少参加推理」 |
 | `WHAM_INPUT_SCALE` | `1.0` | 输入缩放 |
 | `WHAM_DEDICATED_STREAM` | `1` | 专用 CUDA stream |
 | `WHAM_LOG` | `1` | `0` 关闭所有日志输出（stderr 写入是实时环路里的额外延迟） |

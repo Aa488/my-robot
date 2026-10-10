@@ -1001,19 +1001,20 @@ def run_stream_mt(
             if not stalled:
                 continue
             last, busy = progress.snapshot()
-            logger.critical(f"[Watchdog] stalled={stalled} last={last} busy={busy}")
-            logger.critical(
+            print(f"[Watchdog] stalled={stalled} last={last} busy={busy}", file=sys.stderr, flush=True)
+            print(
                 f"[Watchdog] pid={os.getpid()} process_cpu_s={time.process_time():.1f} "
-                f"threads={threading.active_count()} load={os.getloadavg() if hasattr(os, 'getloadavg') else 'n/a'}"
+                f"threads={threading.active_count()} load={os.getloadavg() if hasattr(os, 'getloadavg') else 'n/a'}",
+                file=sys.stderr, flush=True,
             )
             try:
                 gpu = subprocess.run(
                     ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader"],
                     capture_output=True, text=True, timeout=3, check=False,
                 )
-                logger.critical(f"[Watchdog] GPU status: {gpu.stdout.strip() or gpu.stderr.strip()}")
+                print(f"[Watchdog] GPU status: {gpu.stdout.strip() or gpu.stderr.strip()}", file=sys.stderr, flush=True)
             except Exception as exc:
-                logger.warning(f"[Watchdog] GPU status unavailable: {exc}")
+                print(f"[Watchdog] GPU status unavailable: {exc}", file=sys.stderr, flush=True)
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
             sys.stderr.flush()
             # A native detector call cannot be stopped safely from another Python

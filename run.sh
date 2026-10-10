@@ -330,11 +330,38 @@ if [[ "${RECORD_GMRVIDEO}" == "1" ]]; then
 	INTEGRATED_CMD+=(--record_gmrvideo --video_path "${GMR_VIDEO_PATH}")
 fi
 
-if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then
-	xvfb-run -a "${INTEGRATED_CMD[@]}"
-else
-	"${INTEGRATED_CMD[@]}"
-fi
+restart_count=0
+while true; do
+	# Exit 75 is reserved for a watchdog-confirmed stall. Recreate the entire
+	# Python process; native inference calls cannot be cancelled per thread.
+	if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then
+		if xvfb-run -a "${INTEGRATED_CMD[@]}"; then
+			pipeline_status=0
+		else
+			pipeline_status=$?
+		fi
+	else
+		if "${INTEGRATED_CMD[@]}"; then
+			pipeline_status=0
+		else
+			pipeline_status=$?
+		fi
+	fi
+
+	if [[ "${pipeline_status}" != "75" || "${VIDEO}" != "0" || "${PIPELINE_AUTO_RESTART:-1}" != "1" ]]; then
+		if [[ "${pipeline_status}" != "0" ]]; then
+			echo "[E2E] Pipeline exited with status ${pipeline_status}." >&2
+			exit "${pipeline_status}"
+		fi
+		break
+	fi
+
+	restart_count=$((restart_count + 1))
+	restart_delay=$((restart_count * 2))
+	if (( restart_delay > 30 )); then restart_delay=30; fi
+	echo "[E2E] Watchdog stall exit; restarting webcam pipeline (attempt ${restart_count}, delay ${restart_delay}s)." >&2
+	sleep "${restart_delay}"
+done
 
 echo "[E2E] Done."
 echo "  CSV: ${CSV_PATH}"

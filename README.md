@@ -189,3 +189,7 @@ gzip -dc wham-gmr_local.tar.gz | docker load
 
 - 当前 Dockerfile 默认优先覆盖 `run.sh` 所需链路；`demo.py` 完整 SLAM 路径若需 DPVO CUDA 编译，可在镜像内按 `third-party/DPVO` 的官方步骤补装。
 - 项目目录通过 volume 挂载到容器 `/workspace`
+
+### 实时停流恢复
+
+`VIDEO=0` 的实时模式会监控检测、特征提取、WHAM 和 GMR 的正在处理帧。某个阶段超过 15 秒未返回时，日志会输出最后成功帧、线程栈和 CPU/GPU 状态；`run.sh` 随后重启整条 Python 进程。可用 `PIPELINE_STALL_TIMEOUT_SEC` 调整超时秒数，用 `PIPELINE_WATCHDOG=0` 关闭检测，或用 `PIPELINE_AUTO_RESTART=0` 关闭自动重启。自动重启只针对监控器的退出码 75；正常结束、手动停止和其他错误不会重启。

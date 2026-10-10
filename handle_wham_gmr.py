@@ -253,7 +253,9 @@ def _tail_apply_yup_to_zup(root_orient, trans):
 class TcpStreamSender:
     """Send JPEG frames to Unity StreamReceiver via TCP (127.0.0.1:9876)."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 9876):
+    def __init__(self, host: str | None = None, port: int = 9876):
+        if host is None:
+            host = os.environ.get("WHAM_TCP_HOST", "127.0.0.1")
         self._host = host
         self._port = port
         self._sock: socket.socket | None = None
@@ -627,7 +629,7 @@ def run_stream_mt(
     keypoints_normalizer = Normalizer(cfg)
 
     if is_webcam:
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(os.environ.get("WHAM_CAMERA_URL", 0))
     else:
         cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

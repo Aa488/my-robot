@@ -1305,6 +1305,14 @@ def run_stream_mt(
                     except Full:
                         continue
                 break
+
+            # Real-time (webcam only): cap det_Q to the newest frame(s) so the
+            # extractor always consumes the freshest detection instead of
+            # replaying a backlog that builds up when detection outruns feature
+            # extraction (GPU contention). Mirrors the read_Q / ext_Q caps.
+            if is_webcam and os.environ.get("WHAM_LATEST_FRAME", "1") != "0":
+                _cap_queue_backlog(det_Q, adaptive_keep[0], upstream_drop_count)
+
             frame_id, start_time, frame, track_id, kp2d, bbox_c = data
             
             if track_id is not None:

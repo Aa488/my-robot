@@ -40,6 +40,11 @@ TIME=${TIME:-0}
 ROBOT=${ROBOT:-linglong2}
 ROBOTS=${ROBOTS:-${ROBOT}}
 ROBOT_PATH=${ROBOT_PATH:-}
+# GMR_FORCE_SINGLE_ROBOT=1 disables the multi-robot fan-out (keep only the first
+# robot). No-op for the default single-robot setup, but guarantees one robot + one
+# CSV + no scene offset even if ROBOTS lists several.
+GMR_FORCE_SINGLE_ROBOT=${GMR_FORCE_SINGLE_ROBOT:-0}
+export GMR_FORCE_SINGLE_ROBOT
 
 # ROBOT_PATH supports both robot key (same choices as --robot) and custom XML path.
 if [[ -n "${ROBOT_PATH}" ]]; then
@@ -56,7 +61,9 @@ fi
 # Backward compatibility: old RECORD_VIDEO controls both sides when specific flags are not set.
 LEGACY_RECORD_VIDEO=${RECORD_VIDEO:-1}
 RECORD_WHAMVIDEO=${RECORD_WHAMVIDEO:-${LEGACY_RECORD_VIDEO}}
-RECORD_GMRVIDEO=${RECORD_GMRVIDEO:-${LEGACY_RECORD_VIDEO}}
+# Robot mp4 recording is OFF by default: rendering + video encoding is a real
+# latency/GPU cost in the stream loop. Set RECORD_GMRVIDEO=1 to re-enable it.
+RECORD_GMRVIDEO=${RECORD_GMRVIDEO:-0}
 USE_XVFB_GMR=${USE_XVFB_GMR:-0}
 # WHAM preview window: empty = follow RECORD_WHAMVIDEO; 1 = always show; 0 = never.
 WHAM_PREVIEW=${WHAM_PREVIEW:-}
@@ -141,8 +148,10 @@ CAMERA_LOOKAT_HEIGHT_OFFSET=${CAMERA_LOOKAT_HEIGHT_OFFSET:-0.50}
 CAMERA_ELEVATION=${CAMERA_ELEVATION:-0}
 CAMERA_DISTANCE_SCALE=${CAMERA_DISTANCE_SCALE:-1.5}
 CAMERA_AZIMUTH=${CAMERA_AZIMUTH:-90}
-# GMR robot video recording: 1 = headless offscreen (no GLFW window; renders only
-# the mp4 frame, ~half the GPU load vs the live window), 0 = live window + recording.
+# GMR rendering: GMR_HEADLESS_RECORD=1 (default) renders offscreen with no GLFW
+# window; 0 shows a live RobotMotionViewer window (the real-time render). mp4
+# recording is a SEPARATE switch (RECORD_GMRVIDEO), so a live window does not
+# imply video encoding.
 GMR_HEADLESS_RECORD=${GMR_HEADLESS_RECORD:-1}
 GMR_VIEWER_MAX_WIDTH=${GMR_VIEWER_MAX_WIDTH:-960}
 GMR_VIEWER_MAX_HEIGHT=${GMR_VIEWER_MAX_HEIGHT:-540}

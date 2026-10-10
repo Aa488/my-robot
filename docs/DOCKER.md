@@ -54,7 +54,7 @@ docker run --gpus all --rm -v $PWD/out:/output \
 |---|---|
 | `/output/csv/live_motion.csv` | 机器人关节角序列（无表头，逗号分隔） |
 | `/output/pkl/my_motion.pkl` | 重定向后的运动 pickle |
-| `/output/video/live_stream_robot.mp4` | 渲染出的机器人动画 |
+| `/output/video/live_stream_robot.mp4` | 渲染出的机器人动画（仅 `RECORD_GMRVIDEO=1` 时产生） |
 
 `linglong2` 的 CSV 每行 37 列：`[tx,ty,tz, qx,qy,qz,qw, 30 个关节角]`；手臂关节在第 23–36 列。
 
@@ -72,6 +72,7 @@ docker run --gpus all --rm -v $PWD/out:/output \
 | `TIME` | `0` | `0` 处理整段视频；`>0` 只处理前 N 秒 |
 | `ROBOT` | `linglong2` | 目标机器人 |
 | `ROBOTS` | = `ROBOT` | 多机器人列表 |
+| `GMR_FORCE_SINGLE_ROBOT` | `0` | `1` 屏蔽多机器人分支，只处理 `ROBOT` 第一个（单机器人、单 CSV、场景无偏移） |
 | `ROBOT_PATH` | 空 | 机器人 key 或自定义 XML 路径 |
 | `OUTPUT_ROOT` | 空 | 设了则所有输出路径基于它，否则用 `output/`、`pkl_outputs/`、`videos/` |
 
@@ -79,11 +80,11 @@ docker run --gpus all --rm -v $PWD/out:/output \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `RECORD_GMRVIDEO` | `1` | 是否渲染机器人动画 mp4 |
+| `RECORD_GMRVIDEO` | `0` | 是否把渲染帧编码写入 mp4 文件（`1` 开启录制，与窗口开关独立） |
 | `RECORD_WHAMVIDEO` | `1` | 是否录 WHAM 网格叠加视频（docker 入口覆盖为 `0`） |
 | `RECORD_VIDEO` | `1` | 旧开关，向后兼容：同时控制上面两个 |
 | `WHAM_PREVIEW` | 空 | 空=跟随 RECORD_WHAMVIDEO；`1` 始终显示；`0` 从不 |
-| `GMR_HEADLESS_RECORD` | `1` | 无窗口离屏渲染（省一半 GPU）；`0` 弹窗口 |
+| `GMR_HEADLESS_RECORD` | `1` | `1` 无窗口离屏渲染（默认）；`0` 弹出 MuJoCo 实时窗口（Windows 原生弹窗，**不**自动写 mp4） |
 | `GMR_VIEWER_MAX_WIDTH/HEIGHT` | `960`/`540` | 离屏渲染分辨率上限 |
 
 ### 相机
@@ -153,9 +154,9 @@ Docker 镜像主要面向**离线视频 → 机器人关节角**的提交流程�
 | `ROBOT` | `linglong2` | 目标机器人 |
 | `WHAM_USE_YOLOPOSE` | `1` | 单阶段 YOLOv8-pose 检测器（~27ms/帧，实时提速关键） |
 | `WHAM_BATCH_K` | `2` | 批量窗口推理，~2× WHAM 吞吐 |
-| `WHAM_LATEST_FRAME` | `0` | **不丢帧**：检测到的每一帧都送进 WHAM（延迟会随积压增长） |
+| `WHAM_LATEST_FRAME` | `1` | **丢帧**：超时丢弃旧帧保持低延迟（默认） |
 | `WHAM_BBOX_DEVICE` | `cpu` | `WHAM_USE_YOLOPOSE=1` 时被忽略，可不设 |
-| `RECORD_GMRVIDEO` | `1` | 输出机器人动画 mp4 |
+| `RECORD_GMRVIDEO` | `0` | 默认不写 mp4；需要视频时设 `1` |
 | `CAMERA_AZIMUTH` | `90` | 正面视角（`0` 为另一侧，二选一） |
 | `CAMERA_ELEVATION` | `0` | 平视（不再俯视） |
 | `CAMERA_DISTANCE_SCALE` | `1.5` | 取景距离，微调让人大小合适 |
@@ -164,15 +165,15 @@ Docker 镜像主要面向**离线视频 → 机器人关节角**的提交流程�
 docker run --gpus all --rm \
   --device /dev/video0:/dev/video0 \
   -e VIDEO=0 -e ROBOT=linglong2 \
-  -e WHAM_USE_YOLOPOSE=1 -e WHAM_BATCH_K=2 -e WHAM_LATEST_FRAME=0 \
-  -e RECORD_GMRVIDEO=1 \
+  -e WHAM_USE_YOLOPOSE=1 -e WHAM_BATCH_K=2 -e WHAM_LATEST_FRAME=1 \
   -e CAMERA_AZIMUTH=90 -e CAMERA_ELEVATION=0 -e CAMERA_DISTANCE_SCALE=1.5 \
   -v $PWD/out:/output \
   11111p5p/wham-gmr:latest
 ```
 
-> `WHAM_LATEST_FRAME=0` 关闭丢帧保护：管线跑得比输入慢时端到端延迟会持续增长，但**一帧都不丢**。要低延迟就改回 `1`（默认）。
+> `WHAM_LATEST_FRAME=1` 开启丢帧保护（默认）：管线跑得比输入慢时丢弃旧帧，端到端延迟有界（~200ms 预算内）。要**一帧都不丢**再改回 `0`，代价是延迟随积压增长。
 > `WHAM_BBOX_DEVICE=cpu` 只在回退到 YOLOv8n+ViTPose 检测器时才有意义。
+> 机器人动画 mp4 默认**不写入**（`RECORD_GMRVIDEO=0`）。MuJoCo 渲染由 `GMR_HEADLESS_RECORD` 控制：默认 `1` 无头离屏、不弹窗；`0` 弹出实时窗口。**窗口与 mp4 完全独立**——弹窗不自动录制，需要视频时单独加 `-e RECORD_GMRVIDEO=1`。
 
 ---
 
@@ -185,7 +186,7 @@ docker run --gpus all --rm \
 | `WHAM_USE_AMP` | `0` | 关 fp16（防手臂跳变） |
 | `GMR_TORCH_DEVICE` | `cuda` | GMR IK 放 GPU（与 run.ps1 一致） |
 | `WHAM_BBOX_DEVICE` | `cpu` | 默认检测器的人框阶段 |
-| `RECORD_GMRVIDEO` | `1` | 输出机器人动画 |
+| `RECORD_GMRVIDEO` | `0` | 默认不写机器人动画 mp4 |
 | `RECORD_WHAMVIDEO` | `0` | 跳过 WHAM 网格视频（省 pytorch3d） |
 | `GMR_HEADLESS_RECORD` / `USE_XVFB_GMR` / `MUJOCO_GL` | `1` / `1` / `egl` | 无头离屏渲染 |
 

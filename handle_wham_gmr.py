@@ -388,15 +388,16 @@ class _HeadlessViewer:
 
         self.viewer = type('_CamHolder', (), {'cam': self._cam})()
 
-        # Offscreen video recording without a GLFW window: only the mp4 render is
-        # done, so recording does not pay a redundant on-screen window render too.
+        # Headless offscreen render for mp4 recording only. record_video is OFF
+        # by default (RECORD_GMRVIDEO=0); TCP streaming / screenshot capture use a
+        # separate mj.Renderer, so this renderer is created only when recording.
         self.record_video = record_video
         self.renderer = None
         self.mp4_writer = None
         if record_video:
             import imageio
-            self.mp4_writer = imageio.get_writer(video_path, fps=motion_fps)
             self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
+            self.mp4_writer = imageio.get_writer(video_path, fps=motion_fps)
 
     def _camera_lookat_from_robot_bounds(self):
         positions = np.asarray(self.data.xpos[1:], dtype=np.float64)
@@ -435,9 +436,11 @@ class _HeadlessViewer:
         if follow_camera:
             self._update_follow_camera()
 
-        if self.record_video:
+        if self.record_video and self.renderer is not None:
             self.renderer.update_scene(self.data, camera=self._cam)
-            self.mp4_writer.append_data(self.renderer.render())
+            rgb = self.renderer.render()
+            if self.mp4_writer is not None:
+                self.mp4_writer.append_data(rgb)
 
     def close(self):
         if self.record_video and self.mp4_writer is not None:
@@ -501,6 +504,12 @@ def run_stream_mt(
     stream_seq_len = max(4, int(os.environ.get('WHAM_STREAM_SEQ_LEN', str(STREAM_SEQ_LEN))))
     tcp_stream_wham = env_flag('TCP_STREAM_WHAM', True)
     tcp_stream_gmr = env_flag('TCP_STREAM_GMR', True)
+    # Live window vs headless. GMR_HEADLESS_RECORD=1 (default) renders the
+    # MuJoCo scene offscreen (no GLFW window); GMR_HEADLESS_RECORD=0 shows the
+    # live RobotMotionViewer window (the "real-time render" the user watches).
+    # mp4 recording is a SEPARATE switch (RECORD_GMRVIDEO), so a live window
+    # does NOT imply video encoding.
+    show_gmr_window = not env_flag('GMR_HEADLESS_RECORD', True)
 
     if is_cuda_device:
         torch.backends.cudnn.benchmark = True
@@ -1639,6 +1648,12 @@ def run_stream_mt(
         return keys or [_normalize_robot_key(getattr(gmr_args, "robot", "unitree_g1"))]
 
     robot_keys = _parse_robot_keys()
+    # GMR_FORCE_SINGLE_ROBOT=1 disables the multi-robot fan-out: keep only the
+    # first robot regardless of --robots. A no-op for the default single-robot
+    # setup (ROBOTS defaults to ROBOT), but guarantees a single robot, a single
+    # CSV and no scene offset even if ROBOTS later lists several robots.
+    if env_flag('GMR_FORCE_SINGLE_ROBOT', False):
+        robot_keys = robot_keys[:1]
 
     def _new_gmr_state(robot_key, index):
         return {
@@ -1867,8 +1882,9 @@ def run_stream_mt(
         )
         _write_unity_qpos_metadata(gmr_state)
         
-        # Create MuJoCo viewer when needed: recording, screenshot capture, or TCP streaming
-        _need_viewer = gmr_args.record_gmrvideo or capture_interval > 0 or (gmr_args.tcp and tcp_stream_gmr)
+        # Create MuJoCo viewer when needed: recording, a live window
+        # (GMR_HEADLESS_RECORD=0), screenshot capture, or TCP streaming.
+        _need_viewer = gmr_args.record_gmrvideo or show_gmr_window or capture_interval > 0 or (gmr_args.tcp and tcp_stream_gmr)
         _is_headless = not os.environ.get('DISPLAY')
         if _need_viewer:
             v_kws = dict(
@@ -1896,15 +1912,14 @@ def run_stream_mt(
             if getattr(gmr_args, 'robot_path', None) is not None:
                 v_kws['robot_path'] = gmr_args.robot_path
 
-            # Headless offscreen path (no GLFW window). Recording via the GLFW
-            # RobotMotionViewer renders TWICE per frame (window + offscreen mp4),
-            # which doubles GPU load and latency. GMR_HEADLESS_RECORD=1 (default)
-            # records headlessly regardless of DISPLAY (Windows, Docker/xvfb, etc.);
-            # GMR_HEADLESS_RECORD=0 keeps the live window. Non-recording
-            # (TCP/capture) still falls back to headless only when no display.
+            # Headless offscreen path (no GLFW window). GMR_HEADLESS_RECORD=1
+            # (default) renders headlessly. GMR_HEADLESS_RECORD=0 shows a live
+            # RobotMotionViewer window — on Windows GLFW opens a native window
+            # without needing DISPLAY, so only fall back to headless on a
+            # genuinely display-less *non-Windows* host (os.name != 'nt').
             _use_headless = (
-                (gmr_args.record_gmrvideo and env_flag('GMR_HEADLESS_RECORD', True))
-                or (_is_headless and not gmr_args.record_gmrvideo)
+                env_flag('GMR_HEADLESS_RECORD', True)
+                or (os.name != 'nt' and _is_headless)
             )
             if _use_headless:
                 try:
@@ -1925,8 +1940,6 @@ def run_stream_mt(
                         logger.error("  Try: export MUJOCO_GL=egl  or  pip install mujoco[egl]")
                         gmr_state["renderer"] = None
             else:
-                if _is_headless and gmr_args.record_gmrvideo:
-                    logger.warning("Video recording requires a display server; may fail on headless.")
                 try:
                     gmr_state["viewer"] = RobotMotionViewer(**v_kws)
                     logger.info(f"Initialized GMR viewer for {gmr_args.robot}")
@@ -1944,7 +1957,7 @@ def run_stream_mt(
     def init_gmr_state(state, betas, create_viewer=None):
         _need_viewer = (
             bool(create_viewer) if create_viewer is not None
-            else (gmr_args.record_gmrvideo or capture_interval > 0 or (gmr_args.tcp and tcp_stream_gmr))
+            else (gmr_args.record_gmrvideo or show_gmr_window or capture_interval > 0 or (gmr_args.tcp and tcp_stream_gmr))
         )
         if state["retarget"] is not None:
             if not _need_viewer or state.get("viewer") is not None or state.get("viewer_init_failed", False):
@@ -2019,10 +2032,9 @@ def run_stream_mt(
             v_kws["robot_path"] = gmr_args.robot_path
 
         _is_headless = not os.environ.get("DISPLAY")
-        _record_this = gmr_args.record_gmrvideo and state["index"] == 0
         _use_headless = (
-            (_record_this and env_flag('GMR_HEADLESS_RECORD', True))
-            or (_is_headless and not _record_this)
+            env_flag('GMR_HEADLESS_RECORD', True)
+            or (os.name != 'nt' and _is_headless)
         )
         try:
             if _use_headless:
@@ -2582,7 +2594,7 @@ def run_stream_mt(
                 )
                 rendered_gmr_preview = False
                 gmr_preview_frames = []
-                if render_gmr_preview_this_frame or capture_interval > 0 or gmr_args.record_gmrvideo:
+                if show_gmr_window or render_gmr_preview_this_frame or capture_interval > 0 or gmr_args.record_gmrvideo:
                     for robot_key, state in gmr_states.items():
                         try:
                             init_gmr_state(state, bt, create_viewer=True)
@@ -2594,7 +2606,7 @@ def run_stream_mt(
                             need_viewer_step = (
                                 state["viewer"] is not None and
                                 state.get("csv_row_count", 0) > max(0, int(gmr_args.viewer_warmup_frames)) and
-                                (gmr_args.record_gmrvideo or capture_interval > 0 or render_gmr_preview_this_frame)
+                                (show_gmr_window or gmr_args.record_gmrvideo or capture_interval > 0 or render_gmr_preview_this_frame)
                             )
                             if not need_viewer_step:
                                 continue

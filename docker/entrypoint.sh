@@ -8,7 +8,7 @@
 # Outputs (under /output, created by run.sh):
 #   /output/csv/live_motion.csv        robot joint-angle sequence
 #   /output/pkl/my_motion.pkl          retargeted motion (python pickle)
-#   /output/video/live_stream_robot.mp4  rendered robot animation
+#   /output/video/live_stream_robot.mp4  rendered robot animation (only when RECORD_GMRVIDEO=1)
 
 set -euo pipefail
 
@@ -23,13 +23,16 @@ export VIDEO="${1:-${VIDEO:-/opt/src/wham/examples/drone_video.mp4}}"
 # Target robot (override with -e ROBOT=...).
 export ROBOT="${ROBOT:-linglong2}"
 
-# Headless recording by default: MuJoCo EGL offscreen renderer, no GLFW window, so
-# recording does a single offscreen render per frame (GMR_HEADLESS_RECORD=1). To pop
-# a live viewer window, override with
+# Headless by default: MuJoCo EGL offscreen renderer, no GLFW window
+# (GMR_HEADLESS_RECORD=1). Robot mp4 recording is OFF by default — rendering +
+# video encoding is a real latency/GPU cost in the stream loop. Set
+# -e RECORD_GMRVIDEO=1 to record the robot animation (recording is independent
+# of the window switch; it does NOT force a window). To also pop a live viewer
+# window, override with
 #   -e GMR_HEADLESS_RECORD=0 -e MUJOCO_GL=glfw -e DISPLAY=<x-server>:0
 # (DISPLAY must point at a reachable X server, e.g. VcXsrv on the Windows host).
-# Robot-side rendering only; skip the WHAM mesh-overlay video (needs pytorch3d).
-export RECORD_GMRVIDEO="${RECORD_GMRVIDEO:-1}"
+# Skip the WHAM mesh-overlay video (needs pytorch3d).
+export RECORD_GMRVIDEO="${RECORD_GMRVIDEO:-0}"
 export RECORD_WHAMVIDEO="${RECORD_WHAMVIDEO:-0}"
 export GMR_HEADLESS_RECORD="${GMR_HEADLESS_RECORD:-1}"
 export USE_XVFB_GMR="${USE_XVFB_GMR:-1}"

@@ -154,6 +154,8 @@ $TIME         = _env TIME         "0"
 $ROBOT        = _env ROBOT        "linglong2"
 $ROBOTS       = _env ROBOTS       $ROBOT
 $ROBOT_PATH   = _env ROBOT_PATH   ""
+$GMR_FORCE_SINGLE_ROBOT = _env GMR_FORCE_SINGLE_ROBOT "0"
+$env:GMR_FORCE_SINGLE_ROBOT = $GMR_FORCE_SINGLE_ROBOT
 
 # ROBOT_PATH supports both robot key and custom XML path.
 $CUSTOM_ROBOT_XML = ""
@@ -166,9 +168,11 @@ if ($ROBOT_PATH) {
 }
 
 # Backward compatibility.
-$LEGACY_RECORD_VIDEO  = _env RECORD_VIDEO   "1"
+$LEGACY_RECORD_VIDEO  = _env RECORD_VIDEO   "0"
 $RECORD_WHAMVIDEO     = _env RECORD_WHAMVIDEO $LEGACY_RECORD_VIDEO
-$RECORD_GMRVIDEO      = _env RECORD_GMRVIDEO  $LEGACY_RECORD_VIDEO
+# Robot mp4 recording is OFF by default: rendering + video encoding is a real
+# latency/GPU cost in the stream loop. Set RECORD_GMRVIDEO=1 to re-enable it.
+$RECORD_GMRVIDEO      = _env RECORD_GMRVIDEO  "0"
 $USE_XVFB_GMR         = _env USE_XVFB_GMR     "0"
 $WHAM_PREVIEW         = _env WHAM_PREVIEW     ""
 
@@ -269,9 +273,10 @@ $CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.5"
 $CAMERA_AZIMUTH              = _env CAMERA_AZIMUTH              "90"
 $TCP                         = _env TCP                         "0"
 
-# GMR robot video recording: 1 = headless offscreen (no GLFW window; renders only
-# the mp4 frame, ~half the GPU load vs the live window), 0 = live window + recording.
-# Headless recording writes the same robot mp4 — it just skips the on-screen render.
+# GMR rendering: GMR_HEADLESS_RECORD=1 (default) renders offscreen with no GLFW
+# window; 0 shows a live RobotMotionViewer window (the real-time render). mp4
+# recording is a SEPARATE switch (RECORD_GMRVIDEO), so a live window does not
+# imply video encoding.
 $GMR_HEADLESS_RECORD = _env GMR_HEADLESS_RECORD "1"
 $env:GMR_HEADLESS_RECORD = $GMR_HEADLESS_RECORD
 # Offscreen render resolution cap (headless recording renders at this size; lower
@@ -328,11 +333,13 @@ if ($RECORD_GMRVIDEO -eq "1" -and $USE_XVFB_GMR -eq "1") {
     Write-Host "[E2E] GMR is running with xvfb; MuJoCo window will not appear on physical screen."
     Write-Warning "[E2E] xvfb-run is not available on Windows. Falling back to direct rendering."
 }
-if ($RECORD_GMRVIDEO -eq "1" -and -not $env:DISPLAY) {
-    if ($GMR_HEADLESS_RECORD -eq "1") {
-        Write-Host "[E2E] GMR recording in headless offscreen mode (no window needed)."
+if ($GMR_HEADLESS_RECORD -eq "1") {
+    Write-Host "[E2E] GMR render: headless offscreen (no window)."
+} else {
+    if ($env:DISPLAY) {
+        Write-Host "[E2E] GMR render: live window (DISPLAY=$env:DISPLAY)."
     } else {
-        Write-Host "[E2E] Warning: DISPLAY is empty; MuJoCo window may not appear."
+        Write-Host "[E2E] GMR render: live window (Windows native GLFW window)."
     }
 }
 

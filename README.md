@@ -197,3 +197,5 @@ gzip -dc wham-gmr_local.tar.gz | docker load
 Docker 中使用宿主机摄像头桥接时，设置 `VIDEO=0` 和 `WHAM_CAMERA_URL`（例如 `http://host.docker.internal:8099/cam`）。向宿主机发送 TCP 预览时设置 `WHAM_TCP_HOST=host.docker.internal`；不设置则使用本机摄像头和 `127.0.0.1`。
 
 最低延迟模式可设置 `WHAM_LATEST_FRAME_KEEP=1 WHAM_ADAPTIVE_KEEP=0`。此时四段 webcam 队列在写入时替换旧帧，慢阶段恢复后直接取最新帧；中间动作会被跳过。默认的自适应窗口仍保留多帧以维持快速动作的连续性。
+
+webcam 的 TCP 机器人预览默认高度为 360；非实时视频仍为 720。可用 `GMR_TCP_RENDER_HEIGHT=720` 恢复原尺寸，或按画质需求设置其他高度。确认日志中的离屏渲染器实际尺寸后，再比较 CPU、帧率和动作总时延。

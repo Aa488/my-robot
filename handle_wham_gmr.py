@@ -699,7 +699,10 @@ def run_stream_mt(
         if for_capture and not bool(getattr(gmr_args, "tcp", False)):
             return 480, 640, "screenshot capture"
 
-        base_h = max(120, int(os.environ.get("GMR_TCP_RENDER_HEIGHT", "720")))
+        # Live TCP preview is rendered on the critical path. At half the
+        # height, the default webcam frame has about one quarter as many pixels.
+        default_height = 360 if is_webcam and bool(getattr(gmr_args, "tcp", False)) and tcp_stream_gmr else 720
+        base_h = max(120, int(os.environ.get("GMR_TCP_RENDER_HEIGHT", str(default_height))))
         requested_w = int(os.environ.get("GMR_TCP_RENDER_WIDTH", "0") or "0")
         aspect = max(0.1, min(10.0, width / max(float(height), 1.0)))
         base_w = max(2, requested_w if requested_w > 0 else int(round(base_h * aspect)))

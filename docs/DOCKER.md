@@ -86,6 +86,7 @@ docker run --gpus all --rm -v $PWD/out:/output \
 | `WHAM_PREVIEW` | 空 | 空=跟随 RECORD_WHAMVIDEO；`1` 始终显示；`0` 从不 |
 | `GMR_HEADLESS_RECORD` | `1` | `1` 无窗口离屏渲染（默认）；`0` 弹出 MuJoCo 实时窗口（Windows 原生弹窗，**不**自动写 mp4） |
 | `GMR_VIEWER_MAX_WIDTH/HEIGHT` | `960`/`540` | 离屏渲染分辨率上限 |
+| `GMR_RENDER_SCALE` | `1.0` | MuJoCo 渲染分辨率缩放（0.1–1.0），如 `0.5` = 半分辨率，降 GPU 开销 |
 
 ### 相机
 
@@ -118,6 +119,7 @@ docker run --gpus all --rm -v $PWD/out:/output \
 | `WHAM_INFER_INTERVAL` | `1` | 推理间隔 |
 | `WHAM_INPUT_SCALE` | `1.0` | 输入缩放 |
 | `WHAM_DEDICATED_STREAM` | `1` | 专用 CUDA stream |
+| `WHAM_LOG` | `1` | `0` 关闭所有日志输出（stderr 写入是实时环路里的额外延迟） |
 
 ### GMR / IK 重定向
 

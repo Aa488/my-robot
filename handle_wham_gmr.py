@@ -316,6 +316,11 @@ import signal
 import torch
 import numpy as np
 from loguru import logger
+
+# WHAM_LOG=0 disables loguru output (the default stderr sink is a real latency
+# cost in the real-time stream loop). Default keeps logging on for development.
+if os.environ.get("WHAM_LOG", "1").strip().lower() in ("0", "false", "no", "off"):
+    logger.remove()
 from queue import Queue, Full, Empty
 from contextlib import nullcontext
 
@@ -694,6 +699,13 @@ def run_stream_mt(
     def gmr_window_size():
         max_w = max(320, int(os.environ.get("GMR_VIEWER_MAX_WIDTH", str(preview_max_w))))
         max_h = max(240, int(os.environ.get("GMR_VIEWER_MAX_HEIGHT", str(preview_max_h))))
+        # GMR_RENDER_SCALE optionally shrinks the MuJoCo render resolution to cut
+        # GPU cost in the stream loop (e.g. 0.5 = half res). 1.0 (default) = no
+        # change. Clamped to [0.1, 1.0].
+        render_scale = float(os.environ.get("GMR_RENDER_SCALE", "1.0"))
+        render_scale = max(0.1, min(1.0, render_scale))
+        max_w = max(2, int(round(max_w * render_scale)))
+        max_h = max(2, int(round(max_h * render_scale)))
         scale = min(max_w / max(float(width), 1.0), max_h / max(float(height), 1.0), 1.0)
         return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
@@ -1258,6 +1270,16 @@ def run_stream_mt(
                     f"valid={valid_count} selected_track={selected_track_id} track_id={track_id} det_Q={safe_qsize(det_Q)}"
                 )
             
+            if track_id is None and is_webcam:
+                # No person in this frame: in real-time webcam mode it carries no
+                # trajectory signal, so don't let it occupy a backlog slot (or flow
+                # through det_Q -> ext_Q -> wham_Q). Drop it and read the next
+                # frame. File video still replays every frame (downstream already
+                # skips person-less frames).
+                if frame_id == 0 or frame_id % heartbeat_frames == 0:
+                    logger.warning(f"[Detect] frame={frame_id} no person detected; dropped (not queued)")
+                continue
+
             while not stop_event.is_set():
                 try:
                     det_Q.put((frame_id, start_time, frame, track_id, kp2d, bbox_c), timeout=0.1)

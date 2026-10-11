@@ -15,6 +15,8 @@ COPY assets/linglong2/linglong2.xml /opt/src/wham/assets/linglong2/linglong2.xml
 COPY general_motion_retargeting/robot_motion_viewer.py /opt/src/wham/general_motion_retargeting/robot_motion_viewer.py
 COPY general_motion_retargeting/ik_configs/smplx_to_linglong2.json /opt/src/wham/general_motion_retargeting/ik_configs/smplx_to_linglong2.json
 COPY scripts/smplx_to_robot_stream.py /opt/src/wham/scripts/smplx_to_robot_stream.py
+COPY scripts/pipeline_watchdog.py /opt/src/wham/scripts/pipeline_watchdog.py
+COPY scripts/latest_frame_queue.py /opt/src/wham/scripts/latest_frame_queue.py
 
 # Windows checkout strips the exec bit; the exec-form ENTRYPOINT needs it back.
 RUN chmod +x /opt/src/wham/docker/entrypoint.sh /opt/src/wham/run.sh

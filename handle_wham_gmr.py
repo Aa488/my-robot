@@ -326,7 +326,7 @@ from loguru import logger
 if os.environ.get("WHAM_LOG", "1").strip().lower() in ("0", "false", "no", "off"):
     logger.remove()
 from queue import Queue, Full, Empty
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 
 try:
     import termios
@@ -510,6 +510,16 @@ def run_stream_mt(
     detect_interval = max(1, int(os.environ.get('WHAM_DETECT_INTERVAL', '2')))
     infer_interval = max(1, int(os.environ.get('WHAM_INFER_INTERVAL', '1')))
     batch_k = max(1, int(os.environ.get('WHAM_BATCH_K', '1')))
+    # GPU 调度器（WHAM_GPU_SCHEDULER=1，仅 CUDA）：WHAM 独占、YOLO/ViTPose/GMR-IK
+    # 互相并行，避免 WHAM 的 16 步自回归被单卡争抢拖慢（见 gpu_shared/exclusive_slot）。
+    gpu_scheduler_enabled = env_flag("WHAM_GPU_SCHEDULER", False) and is_cuda_device
+    # GMR/IK 实际跑在哪个设备上（gmr_args.torch_device）。CPU 上的 retarget 不碰 GPU，
+    # 不该被 GPU 调度器的读写锁堵住（否则 WHAM 独占窗会白白拖住 CPU 的 IK）。
+    gmr_on_cuda = (
+        gmr_args is not None
+        and str(getattr(gmr_args, 'torch_device', 'cpu')).lower().startswith('cuda')
+        and torch.cuda.is_available()
+    )
     stream_seq_len = max(4, int(os.environ.get('WHAM_STREAM_SEQ_LEN', str(STREAM_SEQ_LEN))))
     tcp_stream_wham = env_flag('TCP_STREAM_WHAM', True)
     tcp_stream_gmr = env_flag('TCP_STREAM_GMR', True)
@@ -551,7 +561,7 @@ def run_stream_mt(
     logger.info(
         f"Perf opts: amp={int(use_amp)} detect_interval={detect_interval} "
         f"infer_interval={infer_interval} batch_k={batch_k} seq_len={stream_seq_len} device={device} det_device={det_device} bbox_device={bbox_device} "
-        "stream_mode=tail"
+        f"gpu_scheduler={int(gpu_scheduler_enabled)} stream_mode=tail"
     )
     heartbeat_frames = max(1, int(os.environ.get('PIPELINE_HEARTBEAT_FRAMES', '30')))
     low_memory_mode = env_flag("WHAM_LOW_MEMORY_MODE", False)
@@ -833,6 +843,75 @@ def run_stream_mt(
                 q.put(item, timeout=0.1)
             except Full:
                 drop_counter[0] += 1
+
+    # GPU 调度器（WHAM_GPU_SCHEDULER=1）：WHAM 独占、其余并行。
+    # 争抢根源是 WHAM 的 16 步自回归（每步依赖上一步），YOLO/ViTPose/GMR 的 kernel
+    # 一旦插进来，每一步都被拖慢，前向从 ~50ms 膨胀到 ~137-309ms。但 YOLO/ViTPose/
+    # GMR 都是单次短前向，互相争抢代价很小。所以用「写者优先 RW 锁」：
+    #   - WHAM = 写者（gpu_exclusive_slot）：独占整卡跑完 16 步，期间所有读者等待；
+    #   - YOLO/ViTPose/GMR = 读者（gpu_shared_slot）：可互相并行（保留跨阶段流水），
+    #     但 WHAM 运行时全部让路。
+    # 两端跑完都 torch.cuda.synchronize()，保证锁覆盖「真跑完」而非仅 launch。
+    # 锁只包 GPU 段、绝不跨队列 put，避免与下游满队列死锁。默认关（= 现行为）。
+    class _GpuRwLock:
+        def __init__(self):
+            self._c = threading.Condition()
+            self._readers = 0
+            self._writer = False
+            self._waiting_writers = 0
+
+        def acquire_reader(self):
+            with self._c:
+                while self._writer or self._waiting_writers:
+                    self._c.wait()
+                self._readers += 1
+
+        def release_reader(self):
+            with self._c:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._c.notify_all()
+
+        def acquire_writer(self):
+            with self._c:
+                self._waiting_writers += 1
+                try:
+                    while self._writer or self._readers:
+                        self._c.wait()
+                    self._writer = True
+                finally:
+                    self._waiting_writers -= 1
+
+        def release_writer(self):
+            with self._c:
+                self._writer = False
+                self._c.notify_all()
+
+    _gpu_rw = _GpuRwLock() if gpu_scheduler_enabled else None
+
+    @contextmanager
+    def gpu_shared_slot():
+        if _gpu_rw is None:
+            yield
+            return
+        _gpu_rw.acquire_reader()
+        try:
+            yield
+            torch.cuda.synchronize()
+        finally:
+            _gpu_rw.release_reader()
+
+    @contextmanager
+    def gpu_exclusive_slot():
+        if _gpu_rw is None:
+            yield
+            return
+        _gpu_rw.acquire_writer()
+        try:
+            yield
+            torch.cuda.synchronize()
+        finally:
+            _gpu_rw.release_writer()
 
     thread_failure_lock = threading.Lock()
     thread_failure = {"message": None}
@@ -1264,7 +1343,8 @@ def run_stream_mt(
 
             need_detect = (frame_id - last_detect_frame) >= detect_interval or last_track_id is None
             if need_detect:
-                detector.track(frame, fps, 1000)
+                with gpu_shared_slot():
+                    detector.track(frame, fps, 1000)
                 poses = detector.pose_results_last
                 poses_count = len(poses)
                 valid_count = 0
@@ -1369,14 +1449,16 @@ def run_stream_mt(
 
                 with torch.inference_mode():
                     with autocast_ctx():
-                        feature = extractor.model(norm_img, encode=True)
+                        with gpu_shared_slot():
+                            feature = extractor.model(norm_img, encode=True)
 
                 init_data = init_cache.get(track_id)
                 if init_data is None:
                     dummy_tracking = {track_id: {}}
                     with torch.inference_mode():
                         with autocast_ctx():
-                            extractor.predict_init(norm_img, dummy_tracking, track_id, flip_eval=False)
+                            with gpu_shared_slot():
+                                extractor.predict_init(norm_img, dummy_tracking, track_id, flip_eval=False)
                     init_data = dummy_tracking[track_id]
                     init_cache[track_id] = init_data
                 
@@ -1473,19 +1555,22 @@ def run_stream_mt(
             with stream_ctx:
                 if wham_stream is not None:
                     wham_stream.wait_stream(torch.cuda.default_stream())
-                _t0 = time.perf_counter()
+                _t_wait0 = time.perf_counter()
                 with torch.inference_mode():
                     with autocast_ctx():
-                        pred = network(
-                            x, inits, feature,
-                            mask=mask, init_root=init_root_b, cam_angvel=cam_angvel,
-                            return_y_up=True,
-                            cam_intrinsics=intrinsics_batch.repeat(K, 1, 1, 1),
-                            bbox=bbox, res=res_batch.repeat(K, 1),
-                            refine_traj=False, states=None)
+                        with gpu_exclusive_slot():
+                            _t0 = time.perf_counter()
+                            pred = network(
+                                x, inits, feature,
+                                mask=mask, init_root=init_root_b, cam_angvel=cam_angvel,
+                                return_y_up=True,
+                                cam_intrinsics=intrinsics_batch.repeat(K, 1, 1, 1),
+                                bbox=bbox, res=res_batch.repeat(K, 1),
+                                refine_traj=False, states=None)
+                _wait_ms = (_t0 - _t_wait0) * 1000
                 _t_ms = (time.perf_counter() - _t0) * 1000
                 if pending[0][0] % 10 < K:
-                    logger.info(f"[WHAM] infer_ms={_t_ms:.1f}  batch={K}  frames={pending[0][0]}-{pending[-1][0]}")
+                    logger.info(f"[WHAM] infer_ms={_t_ms:.1f} wait_ms={_wait_ms:.1f}  batch={K}  frames={pending[0][0]}-{pending[-1][0]}")
                 for p in range(K):          # 按帧序 oldest -> newest 回放
                     j = K - 1 - p
                     single = _slice_pred_single(pred, j, K, F)
@@ -1623,29 +1708,32 @@ def run_stream_mt(
                             # Order WHAM's kernels after the detector/extractor work
                             # (feature, inits, norm_kp2d all live on stream 0).
                             wham_stream.wait_stream(torch.cuda.default_stream())
-                        _t_infer0 = time.perf_counter()
+                        _t_wait0 = time.perf_counter()
                         with torch.inference_mode():
                             with autocast_ctx():
-                                pred = network(
-                                    norm_kp2d,
-                                    inits,
-                                    feature_t,
-                                    mask=mask,
-                                    init_root=init_root,
-                                    cam_angvel=cam_angvel,
-                                    return_y_up=True,
-                                    cam_intrinsics=intrinsics_batch,
-                                    bbox=bbox_t.unsqueeze(0).to(device, non_blocking=True),
-                                    res=res_batch,
-                                    refine_traj=False,
-                                    states=None
-                                )
+                                with gpu_exclusive_slot():
+                                    _t_infer0 = time.perf_counter()
+                                    pred = network(
+                                        norm_kp2d,
+                                        inits,
+                                        feature_t,
+                                        mask=mask,
+                                        init_root=init_root,
+                                        cam_angvel=cam_angvel,
+                                        return_y_up=True,
+                                        cam_intrinsics=intrinsics_batch,
+                                        bbox=bbox_t.unsqueeze(0).to(device, non_blocking=True),
+                                        res=res_batch,
+                                        refine_traj=False,
+                                        states=None
+                                    )
+                        _wait_ms = (_t_infer0 - _t_wait0) * 1000
                         _t_infer_ms = (time.perf_counter() - _t_infer0) * 1000
 
                         verts_cam = extract_latest_vertices(pred).detach().cpu().numpy()
                         smplx_params = extract_latest_smplx_params(pred)
                     if frame_id % 10 == 0:
-                        logger.info(f"[WHAM] infer_ms={_t_infer_ms:.1f}  frame={frame_id}")
+                        logger.info(f"[WHAM] infer_ms={_t_infer_ms:.1f} wait_ms={_wait_ms:.1f}  frame={frame_id}")
                     hist['last_pred'] = (verts_cam.copy(), {k: v.copy() for k, v in smplx_params.items()})
                     while not stop_event.is_set():
                         try:
@@ -2360,7 +2448,9 @@ def run_stream_mt(
         _flatten_source_feet(state, sf)
 
         _t0_ik = time.perf_counter()
-        qp, ik_residuals = state["retarget"].retarget(sf)
+        _ik_ctx = gpu_shared_slot() if gmr_on_cuda else nullcontext()
+        with _ik_ctx:
+            qp, ik_residuals = state["retarget"].retarget(sf)
         ik_ms = (time.perf_counter() - _t0_ik) * 1000
 
         _t0_post = time.perf_counter()
@@ -2575,7 +2665,9 @@ def run_stream_mt(
             # Process via GMR immediately in queue thread
             if gmr_args is not None:
                 _t0_adapt = time.perf_counter()
-                sf, bt = tail_params_to_smplx_frame(gvhmr_params)
+                with gpu_shared_slot():
+                    sf, bt = tail_params_to_smplx_frame(gvhmr_params)
+                _t1_tail = time.perf_counter()
 
                 # Ablation switches (set via environment variables for benchmarking).
                 # Normal usage: all disabled (0) → full stabilization active.
@@ -2646,6 +2738,8 @@ def run_stream_mt(
                         for jn in sf:
                             sf[jn] = (sf[jn][0].astype(np.float64) + offset, sf[jn][1])
 
+                _t1_vel = time.perf_counter()
+
                 # ---- root orientation continuity across WHAM windows ----
                 # WHAM resets root orientation each sliding window, causing
                 # large yaw jumps.  Clamp the pelvis quaternion change per
@@ -2669,6 +2763,7 @@ def run_stream_mt(
                         pelvis_quat /= np.linalg.norm(pelvis_quat)
                         sf["pelvis"] = (sf["pelvis"][0], pelvis_quat)
                 gmr_state["prev_pelvis_quat"] = pelvis_quat.copy()
+                _t1_quat = time.perf_counter()
 
                 if os.environ.get("WHAM_DEBUG_JUMP", "0") == "1":
                     _la = float(sf["left_ankle"][0][2]) if "left_ankle" in sf else 0.0
@@ -2682,6 +2777,13 @@ def run_stream_mt(
                     )
 
                 _t_adapt.append((time.perf_counter() - _t0_adapt) * 1000)
+                if frame_id % 10 == 0:
+                    logger.info(
+                        f"[ADAPT] tail={(_t1_tail - _t0_adapt) * 1000:.1f}ms "
+                        f"vel={( _t1_vel - _t1_tail) * 1000:.1f}ms "
+                        f"quat={(_t1_quat - _t1_vel) * 1000:.1f}ms "
+                        f"total={(_t1_quat - _t0_adapt) * 1000:.1f}ms"
+                    )
 
                 for state in gmr_states.values():
                     _enqueue_latest_gmr_task(state, frame_id, start_time, sf, bt)
@@ -2768,13 +2870,22 @@ def run_stream_mt(
         avg_fps = 1.0 / (sum(frame_times) / len(frame_times))
 
         # Per-second throughput print: how many frames went through the main
-        # loop in the last wall-clock second.
+        # loop in the last wall-clock second, plus the spread of inter-frame
+        # gaps (last `frame_times` window) to tell uniform vs bursty arrival.
         fps_win_count += 1
         if curr_time - fps_win_start >= 1.0:
             win_secs = curr_time - fps_win_start
+            if len(frame_times) >= 2:
+                ft_ms = np.asarray(frame_times) * 1000.0
+                gap = (
+                    f"gap_min={ft_ms.min():.0f} gap_max={ft_ms.max():.0f} "
+                    f"gap_std={ft_ms.std():.0f} gap_p95={np.percentile(ft_ms, 95):.0f}ms"
+                )
+            else:
+                gap = "gap=n/a"
             logger.info(
                 f"[FPS] {fps_win_count} frames in last {win_secs:.2f}s = "
-                f"{fps_win_count / win_secs:.1f} fps"
+                f"{fps_win_count / win_secs:.1f} fps  {gap}"
             )
             fps_win_start = curr_time
             fps_win_count = 0

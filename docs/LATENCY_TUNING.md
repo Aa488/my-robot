@@ -46,6 +46,16 @@ $env:WHAM_BATCH_K = "2"   # run.ps1 已默认 2；直接 python 跑时 fallback 
   - `4`：71.9fps；`8`：144.9fps（延迟超预算，不建议）
 - 建议：实时模式固定 `2`。**若你直接 `python handle_wham_gmr.py`（不走 run.ps1），记得手动设 `$env:WHAM_BATCH_K="2"`**，否则回退到 1、又会丢帧。
 
+### ⭐ WHAM_GPU_SCHEDULER=1 —— WHAM 独占、其余并行，消除争抢
+```powershell
+$env:WHAM_GPU_SCHEDULER = "1"
+```
+- 背景：链路里 4 路 CUDA 前向（YOLO ~27ms、ViTPose 特征、WHAM 16 步自回归 ~50ms、GMR-IK ~24ms）各自在独立线程里异步发射 kernel，CUDA 让它们在单卡上交错。WHAM 的 16 步每一步都要跟别人抢 SM，实测被拖到 ~137-309ms，产出从均匀 ~180ms 变成突发（`gap_max` 冲到 462ms、`gap_std≈gap_mean`）。
+- 作用：用「写者优先读写锁」——WHAM 是**写者**（独占整卡跑完 16 步，期间其余全等，回到 ~50ms），YOLO/ViTPose/GMR 是**读者**（互相并行、保留跨阶段流水，但 WHAM 运行时全部让路）。两端跑完都 `torch.cuda.synchronize()` 等 GPU 真跑完才放锁。
+- 为什么不全串行：上一版曾把四路全串行（全局互斥锁），结果是 WHAM 前向虽回到 ~50ms，但每路都要排队等别人用完 GPU，等于把流水并行也砍了，净收益为零（`IK` 反而从 23ms 涨到 155ms）。只让 WHAM 独占、其余并行，才同时拿到「WHAM 无争抢」+「短前向流水重叠」。
+- 建议：开它跑同一段视频，看 `[WHAM] infer_ms`（应回到 ~50ms、`wait_ms` 很小）和 `[FPS]` 的 `gap_std`/`gap_max`（应明显下降、趋于均匀）。若 end-to-end 延迟没降反升，再关掉。
+- 说明：开启后 `WHAM_DEDICATED_STREAM` 基本失效（锁已保证互斥），可不管。锁只包 GPU 段、绝不跨队列 put，不会与满队列死锁。默认关（`0` = 现行为）。
+
 ### WHAM_INFER_INTERVAL=2 —— WHAM 少参加推理（复用上一帧姿态）
 ```powershell
 $env:WHAM_INFER_INTERVAL = "2"   # 默认 1（每帧都推理）
@@ -116,6 +126,7 @@ $env:GMR_HEADLESS_RECORD = "1"   # 你已设 0（弹窗）
 | `WHAM_STREAM_SEQ_LEN` | `16` | 滑窗长度，调小更快、时序更短 |
 | `WHAM_INFER_INTERVAL` | `1` | WHAM 推理间隔：`>1` 时中间帧复用上一帧 3D 姿态（batch 模式也生效），=「WHAM 少参加推理」 |
 | `WHAM_DEDICATED_STREAM` | `1` | 专用 CUDA stream（CUDA 设备生效） |
+| `WHAM_GPU_SCHEDULER` | `0` | GPU 调度器：WHAM 独占、YOLO/ViTPose/GMR-IK 互相并行，消除 WHAM 的单卡争抢（见下节） |
 
 ### 丢帧 / 积压（仅 `VIDEO=0` 生效）
 | 开关 | 默认 | 说明 |
